@@ -5,8 +5,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createXpStore, calculateProgress, xpRequiredForLevel, isEligibleMessage } = require('../xp-store');
-const { renderRankCardSafely } = require('../rank-card');
+const { createXpStore, calculateProgress, xpRequiredForLevel, cumulativeXpForLevel, isEligibleMessage } = require('../xp-store');
+const { renderRankCardSafely, UNICODE_FONT_FAMILY } = require('../rank-card');
 const { grantMilestoneRoles } = require('../level-rewards');
 const { buildLevelRolePanel, buildLevelRoleList } = require('../leveling-ui');
 const { confirmServerReset, resetGuildAfterConfirmation } = require('../level-admin');
@@ -46,20 +46,23 @@ function message(guildId = GUILD_A, userId = USER_A, channelId = CHANNEL_A, extr
   };
 }
 
-test('XP increments with deterministic 15–25 range and the level progress formula is consistent', () => {
+test('chat XP is fixed at 25 and level requirements double safely', () => {
   withStore(store => {
     const result = store.awardMessage(message(), 1000);
     assert.equal(result.awarded, true);
-    assert.equal(result.xpAdded, 20);
-    assert.equal(result.stats.totalXp, 20);
+    assert.equal(result.xpAdded, 25);
+    assert.equal(result.stats.totalXp, 25);
     assert.deepEqual(calculateProgress(99), {
       totalXp: 99, level: 0, currentLevelXp: 99, xpToNextLevel: 100, nextLevelAt: 100, progress: 0.99
     });
-    assert.equal(xpRequiredForLevel(1), 100);
-    assert.equal(xpRequiredForLevel(2), 250);
+    assert.deepEqual(Array.from({ length: 8 }, (_, i) => Number(xpRequiredForLevel(i + 1))), [100, 200, 400, 800, 1600, 3200, 6400, 12800]);
     assert.equal(calculateProgress(100).level, 1);
-    assert.equal(calculateProgress(249).currentLevelXp, 149);
-    assert.equal(calculateProgress(250).level, 2);
+    assert.equal(calculateProgress(299).currentLevelXp, 199);
+    assert.equal(calculateProgress(300).level, 2);
+    assert.deepEqual(calculateProgress(1000), {
+      totalXp: 1000, level: 3, currentLevelXp: 300, xpToNextLevel: 800,
+      nextLevelAt: 1500, progress: 0.375
+    }, 'multiple level crossings keep the exact remainder inside the current level');
   }, { randomXp: () => 20 });
 });
 
@@ -79,9 +82,9 @@ test('server/member data is isolated and survives reopening the JSON store', () 
     store.awardMessage(message(GUILD_B, USER_A), 1000);
     store.awardMessage(message(GUILD_A, USER_B), 1000);
     const restarted = createXpStore(file, { randomXp: () => 20 });
-    assert.equal(restarted.getStats(GUILD_A, USER_A).totalXp, 20);
-    assert.equal(restarted.getStats(GUILD_B, USER_A).totalXp, 20);
-    assert.equal(restarted.getStats(GUILD_A, USER_B).totalXp, 20);
+    assert.equal(restarted.getStats(GUILD_A, USER_A).totalXp, 25);
+    assert.equal(restarted.getStats(GUILD_B, USER_A).totalXp, 25);
+    assert.equal(restarted.getStats(GUILD_A, USER_B).totalXp, 25);
     assert.equal(restarted.getStats(GUILD_B, USER_B).totalXp, 0);
   }, { randomXp: () => 20 });
 });
@@ -91,7 +94,7 @@ test('sequential XP writes do not lose updates', () => {
     for (let index = 0; index < 30; index++) {
       assert.equal(store.awardMessage(message(), 1000 + index).awarded, true);
     }
-    assert.equal(store.getStats(GUILD_A, USER_A).totalXp, 600);
+    assert.equal(store.getStats(GUILD_A, USER_A).totalXp, 750);
   }, { randomXp: () => 20, cooldownMs: 0 });
 });
 
@@ -104,7 +107,7 @@ test('admin give-xp and remove-xp apply validated totals and clamp XP at zero', 
     const removed = store.removeXp(GUILD_A, USER_A, 70);
     assert.equal(removed.applied, 70);
     assert.equal(removed.stats.totalXp, 250);
-    assert.equal(removed.stats.level, 2);
+    assert.equal(removed.stats.level, 1);
     const clamped = store.removeXp(GUILD_A, USER_A, 1000);
     assert.equal(clamped.applied, 250);
     assert.equal(clamped.stats.totalXp, 0);
@@ -117,16 +120,16 @@ test('admin give-level and remove-level set exact existing-formula thresholds', 
   withStore(store => {
     store.giveXp(GUILD_A, USER_A, 275);
     const given = store.giveLevels(GUILD_A, USER_A, 3);
-    assert.equal(given.previousStats.level, 2);
-    assert.equal(given.stats.level, 5);
-    assert.equal(given.stats.totalXp, xpRequiredForLevel(5));
+    assert.equal(given.previousStats.level, 1);
+    assert.equal(given.stats.level, 4);
+    assert.equal(BigInt(given.stats.totalXp), cumulativeXpForLevel(4));
     const removed = store.removeLevels(GUILD_A, USER_A, 2);
-    assert.equal(removed.stats.level, 3);
-    assert.equal(removed.stats.totalXp, xpRequiredForLevel(3));
+    assert.equal(removed.stats.level, 2);
+    assert.equal(BigInt(removed.stats.totalXp), cumulativeXpForLevel(2));
     const clamped = store.removeLevels(GUILD_A, USER_A, 500);
     assert.equal(clamped.stats.level, 0);
-    assert.equal(clamped.stats.totalXp, xpRequiredForLevel(0));
-    assert.equal(clamped.applied, 3);
+    assert.equal(BigInt(clamped.stats.totalXp), cumulativeXpForLevel(0));
+    assert.equal(clamped.applied, 2);
   });
 });
 
@@ -150,7 +153,7 @@ test('admin XP persists after restart and remains isolated by guild', () => {
     store.giveLevels(GUILD_B, USER_A, 2);
     const restarted = createXpStore(file);
     assert.equal(restarted.getStats(GUILD_A, USER_A).totalXp, 140);
-    assert.equal(restarted.getStats(GUILD_B, USER_A).totalXp, xpRequiredForLevel(2));
+    assert.equal(BigInt(restarted.getStats(GUILD_B, USER_A).totalXp), cumulativeXpForLevel(2));
     assert.equal(restarted.getStats(GUILD_A, USER_B).totalXp, 0);
   });
 });
@@ -225,7 +228,8 @@ test('guild configuration and reward mappings validate and persist', () => {
       excludedChannelIds: [CHANNEL_A],
       rewards: [{ level: 0, roleId: ROLE_B }, { level: 5, roleId: ROLE_A }],
       boosters: [],
-      levelPanel: null
+      levelPanel: null,
+      activityXp: 25
     });
     assert.equal(store.awardMessage(message(), 1000).reason, 'excluded-channel');
     store.setAnnouncement(GUILD_A, null);
@@ -258,11 +262,11 @@ test('admin set and reset operations use the level formula, preserve config, and
     store.addBooster(GUILD_A, 'channel', CHANNEL_A, 2);
     store.setLevelPanel(GUILD_A, CHANNEL_A, '50000000000000001');
     store.setXp(GUILD_A, USER_A, 350);
-    assert.equal(store.setLevel(GUILD_A, USER_A, 7).stats.totalXp, xpRequiredForLevel(7));
+    assert.equal(BigInt(store.setLevel(GUILD_A, USER_A, 7).stats.totalXp), cumulativeXpForLevel(7));
     assert.equal(store.setXp(GUILD_A, USER_A, 0).stats.level, 0);
     assert.throws(() => store.setXp(GUILD_A, USER_A, -1), /Total XP harus/);
-    assert.throws(() => store.setLevel(GUILD_A, USER_A, 5001), /Level harus/);
-    assert.equal(store.setLevel(GUILD_A, USER_A, 5000).stats.totalXp, xpRequiredForLevel(5000));
+    assert.throws(() => store.setLevel(GUILD_A, USER_A, 10000), /Level harus/);
+    assert.equal(BigInt(store.setLevel(GUILD_A, USER_A, 5000).stats.totalXp), cumulativeXpForLevel(5000));
     store.giveXp(GUILD_A, USER_A, 500);
     store.giveXp(GUILD_B, USER_A, 800);
     const removed = store.resetMember(GUILD_A, USER_A);
@@ -292,21 +296,21 @@ test('role and channel XP boosters use the highest match, round once, and dedupe
     const boosted = store.awardMessage(message(GUILD_A, USER_A, CHANNEL_A, {
       id: '60000000000000001', member: { roles: { cache: new Map([[ROLE_A, {}]]) } }
     }), 1000);
-    assert.equal(boosted.baseXp, 20);
-    assert.equal(boosted.multiplier, 2);
-    assert.equal(boosted.xpAdded, 40);
+    assert.equal(boosted.baseXp, 25);
+    assert.equal(boosted.multiplier, 1);
+    assert.equal(boosted.xpAdded, 25);
     assert.equal(store.awardMessage(message(GUILD_A, USER_A, CHANNEL_A, {
       id: '60000000000000001', member: { roles: { cache: new Map([[ROLE_A, {}]]) } }
     }), 70000).reason, 'duplicate');
     store.removeBooster(GUILD_A, 'role', ROLE_A);
     const channelOnly = store.awardMessage(message(GUILD_A, USER_A, CHANNEL_A, { id: '60000000000000002' }), 70000);
-    assert.equal(channelOnly.multiplier, 1.1);
-    assert.equal(channelOnly.xpAdded, 22);
+    assert.equal(channelOnly.multiplier, 1);
+    assert.equal(channelOnly.xpAdded, 25);
     store.removeBooster(GUILD_A, 'channel', CHANNEL_A);
     store.addBooster(GUILD_A, 'channel', CHANNEL_A, 1.1);
     baseXp = 15;
     const fractional = store.awardMessage(message(GUILD_A, USER_B, CHANNEL_A, { id: '60000000000000003' }), 1000);
-    assert.equal(fractional.xpAdded, 17, '15 × 1.1 rounds to nearest XP');
+    assert.equal(fractional.xpAdded, 25, 'legacy multiplier does not change configured final activity XP');
     assert.equal(store.getConfig(GUILD_A).boosters.length, 1);
   }, { randomXp: () => baseXp });
 });
@@ -460,7 +464,7 @@ test('server reset route needs same-admin confirmation and only resets selected 
 
     const unconfirmed = await resetGuildAfterConfirmation({
       ...interaction,
-      fetchReply: async () => ({ awaitMessageComponent: async () => { throw new Error('timeout'); } })
+      fetchReply: async () => ({ awaitMessageComponent: async () => { throw new Error('Collector received no interactions before ending with reason: time'); } })
     }, store);
     assert.equal(unconfirmed.confirmed, false);
     assert.equal(store.getStats(GUILD_B, USER_A).totalXp, 900);
@@ -497,4 +501,69 @@ test('rank card falls back when avatar fetch fails and contains rendering failur
   });
   assert.equal(failed.buffer, null);
   assert.match(failed.error.message, /mock renderer failure/);
+});
+
+test('rank card renders Discord mathematical-alphabet usernames with the registered Unicode fallback', async () => {
+  const stats = calculateProgress(125);
+  const username = '𝐁𝐨𝐥𝐝 𝑖𝑡𝑎𝑙𝑖𝑐 ℭ𝔯𝔶𝔭𝔱𝔬 𝒮𝒸𝓇𝒾𝓅𝓉';
+  assert.equal(UNICODE_FONT_FAMILY, 'Noto Sans Symbols');
+  const rendered = await renderRankCardSafely({ username, stats, rank: 1 });
+  assert.equal(rendered.error, null);
+  assert.ok(Buffer.isBuffer(rendered.buffer));
+  assert.deepEqual([...rendered.buffer.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+});
+
+test('activity XP boost defaults to 25, accepts 200 and 500, rejects 501, and is guild-isolated', () => {
+  withStore(store => {
+    assert.equal(store.getConfig(GUILD_A).activityXp, 25);
+    assert.equal(store.setActivityXp(GUILD_A, 200), 200);
+    assert.equal(store.setActivityXp(GUILD_B, 500), 500);
+    assert.throws(() => store.setActivityXp(GUILD_A, 501), /1–500/);
+    assert.equal(store.awardMessage(message(GUILD_A, USER_A), 10_000).xpAdded, 200);
+    assert.equal(store.awardMessage(message(GUILD_B, USER_A), 10_000).xpAdded, 500);
+    assert.equal(store.getConfig(GUILD_A).activityXp, 200);
+    assert.equal(store.getConfig(GUILD_B).activityXp, 500);
+  });
+});
+
+test('max level is capped at 9999 while arbitrarily large XP continues to accumulate exactly', () => {
+  withStore((store, file) => {
+    const capped = store.setLevel(GUILD_A, USER_A, 9999);
+    assert.equal(capped.stats.level, 9999);
+    const before = BigInt(capped.stats.totalXp);
+    const earned = store.giveXp(GUILD_A, USER_A, 100);
+    assert.equal(earned.stats.level, 9999);
+    assert.equal(BigInt(earned.stats.totalXp), before + 100n);
+    assert.equal(earned.stats.progress, 1);
+    assert.equal(BigInt(createXpStore(file).getStats(GUILD_A, USER_A).totalXp), before + 100n);
+  });
+});
+
+test('media earns the same single configured activity amount and duplicate message events are ignored', () => {
+  withStore(store => {
+    store.setActivityXp(GUILD_A, 200);
+    const media = message(GUILD_A, USER_A, CHANNEL_A, { id: '70000000000000011', content: '', attachments: { size: 1 } });
+    assert.equal(store.awardMessage(media, 1000).xpAdded, 200);
+    assert.equal(store.awardMessage(media, 1001).reason, 'duplicate');
+    assert.equal(store.getStats(GUILD_A, USER_A).totalXp, 200);
+  });
+});
+
+test('leaderboard is paginated by ten and caps visible ranks at one hundred', () => {
+  withStore(store => {
+    for (let i = 0; i < 105; i++) {
+      const userId = String(80000000000000000n + BigInt(i));
+      store.setXp(GUILD_A, userId, 1000 - i);
+    }
+    const first = store.getLeaderboard(GUILD_A, 1, 10);
+    const last = store.getLeaderboard(GUILD_A, 10, 10);
+    assert.equal(first.entries.length, 10);
+    assert.equal(first.entries[0].rank, 1);
+    assert.equal(last.entries.length, 10);
+    assert.equal(last.entries[0].rank, 91);
+    assert.equal(last.entries.at(-1).rank, 100);
+    assert.equal(last.total, 100);
+    assert.equal(last.totalPages, 10);
+    assert.throws(() => store.getLeaderboard(GUILD_A, 11, 10), /maksimal 10/);
+  });
 });

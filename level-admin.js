@@ -1,6 +1,7 @@
 'use strict';
 
 const { ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits } = require('discord.js');
+const activeResetMessages = new Set();
 
 async function confirmServerReset(interaction, options = {}) {
   const guildId = interaction.guildId;
@@ -20,6 +21,7 @@ async function confirmServerReset(interaction, options = {}) {
   });
 
   const response = await interaction.fetchReply();
+  activeResetMessages.add(response.id);
   let component;
   try {
     component = await response.awaitMessageComponent({
@@ -28,17 +30,26 @@ async function confirmServerReset(interaction, options = {}) {
         item.memberPermissions?.has(PermissionFlagsBits.Administrator) &&
         [confirmId, cancelId].includes(item.customId)
     });
-  } catch {
+  } catch (error) {
+    if (!String(error?.message || '').includes('reason: time')) {
+      activeResetMessages.delete(response.id);
+      console.error('[XP] Error saat menunggu konfirmasi reset:', error?.code || error?.name || 'Error');
+      throw error;
+    }
+    activeResetMessages.delete(response.id);
     await interaction.editReply({ content: '⌛ Konfirmasi reset kedaluwarsa; tidak ada data yang dihapus.', components: [] });
     return false;
   }
 
   if (component.user.id !== adminId || component.guildId !== guildId ||
       !component.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-    await component.deferUpdate().catch(() => {});
+    activeResetMessages.delete(response.id);
+    try { await component.deferUpdate(); }
+    catch (error) { console.error('[XP] Acknowledgment konfirmasi tidak valid gagal:', error?.code || error?.name || 'Error'); }
     await interaction.editReply({ content: '❌ Konfirmasi tidak valid; data tidak diubah.', components: [] });
     return false;
   }
+  activeResetMessages.delete(response.id);
   await component.deferUpdate();
   if (component.customId === cancelId) {
     await interaction.editReply({ content: 'Reset dibatalkan; data tidak diubah.', components: [] });
@@ -53,4 +64,4 @@ async function resetGuildAfterConfirmation(interaction, xpStore) {
   return { confirmed: true, ...xpStore.resetGuild(interaction.guildId) };
 }
 
-module.exports = { confirmServerReset, resetGuildAfterConfirmation };
+module.exports = { confirmServerReset, resetGuildAfterConfirmation, activeResetMessages };

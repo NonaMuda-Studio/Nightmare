@@ -204,8 +204,15 @@ function createMusicManager(options = {}) {
       channelId: voiceChannel.id,
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: true
+      // The receiver observes speaking-start only; no audio is recorded or retained.
+      selfDeaf: typeof options.onVoiceActivity !== 'function'
     });
+    if (typeof options.onVoiceActivity === 'function') {
+      connection.receiver?.speaking?.on('start', userId => {
+        try { options.onVoiceActivity(guild.id, userId, voiceChannel.id); }
+        catch (error) { console.warn(`[MUSIC] guild=${guild.id} voice-activity handler gagal: ${error.message}`); }
+      });
+    }
     const player = voice.createAudioPlayer({ behaviors: { noSubscriber: voice.NoSubscriberBehavior.Pause } });
     const created = {
       guildId: guild.id,
@@ -291,7 +298,12 @@ function createMusicManager(options = {}) {
     player.on('error', error => {
       if (created.current?.resource?.metadata?.diagnostics) created.current.resource.metadata.diagnostics.stopReason = 'player-error';
       console.error(`[MUSIC] guild=${guild.id} tahap=player error=${sanitizeExtractorError(error.message)}`);
-      try { created.current?.onError?.(new Error('Player audio Discord mengalami error.')); } catch {}
+      try {
+        Promise.resolve(created.current?.onError?.(new Error('Player audio Discord mengalami error.')))
+          .catch(callbackError => console.warn(`[MUSIC] guild=${guild.id} callback error gagal: ${sanitizeExtractorError(callbackError.message)}`));
+      } catch (callbackError) {
+        console.warn(`[MUSIC] guild=${guild.id} callback error gagal: ${sanitizeExtractorError(callbackError.message)}`);
+      }
       terminateCurrent(created);
       created.current = null;
       void playNext(created);
@@ -343,10 +355,14 @@ function createMusicManager(options = {}) {
     if (!state || state.destroyed) return;
     if (state.current?.resource?.metadata?.diagnostics) state.current.resource.metadata.diagnostics.stopReason = 'disconnect';
     state.destroyed = true;
+    try { options.onVoiceMonitorEnd?.(state.guildId, state.voiceChannelId); }
+    catch (error) { console.warn(`[MUSIC] guild=${state.guildId} voice-monitor cleanup gagal: ${error.message}`); }
     terminateCurrent(state);
     state.queue.length = 0;
-    try { state.player.stop(true); } catch {}
-    try { state.connection.destroy(); } catch {}
+    try { state.player.stop(true); }
+    catch (error) { console.warn(`[MUSIC] guild=${state.guildId} player cleanup gagal: ${sanitizeExtractorError(error.message)}`); }
+    try { state.connection.destroy(); }
+    catch (error) { console.warn(`[MUSIC] guild=${state.guildId} voice cleanup gagal: ${sanitizeExtractorError(error.message)}`); }
     if (players.get(state.guildId) === state) players.delete(state.guildId);
   }
 
@@ -376,7 +392,12 @@ function createMusicManager(options = {}) {
           diagnostics.stopReason = 'stream-error';
           const message = error instanceof Error ? error.message : String(error);
           console.error(`[MUSIC] guild=${state.guildId} tahap=stream-failed bytes=${diagnostics.inputBytes} opusPackets=${diagnostics.opusPackets} pcmBytes=${diagnostics.pcmBytes} opusBytes=${diagnostics.opusBytes} error=${sanitizeExtractorError(message)}`);
-          try { entry.onError?.(new Error('Audio gagal diunduh atau diproses: ' + sanitizeExtractorError(message))); } catch {}
+          try {
+            Promise.resolve(entry.onError?.(new Error('Audio gagal diunduh atau diproses: ' + sanitizeExtractorError(message))))
+              .catch(callbackError => console.warn(`[MUSIC] guild=${state.guildId} callback stream error gagal: ${sanitizeExtractorError(callbackError.message)}`));
+          } catch (callbackError) {
+            console.warn(`[MUSIC] guild=${state.guildId} callback stream error gagal: ${sanitizeExtractorError(callbackError.message)}`);
+          }
           if (state.current === entry) state.player.stop(true);
         };
         const streamTimeout = setTimeout(() => {

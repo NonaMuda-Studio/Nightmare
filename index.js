@@ -13,11 +13,15 @@ const {
   Events,
   Partials,
   EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require('discord.js');
 
 const { createCanvas, loadImage, GlobalFonts } = require('@napi-rs/canvas');
 const { AttachmentBuilder } = require('discord.js');
 const path = require('node:path');
+const { performance } = require('node:perf_hooks');
 const { createMusicManager, formatDuration } = require('./music-system');
 const { createPlaylistStore } = require('./playlist-store');
 const { searchLyrics } = require('./lyrics');
@@ -26,10 +30,52 @@ const { createXpStore } = require('./xp-store');
 const { renderRankCardSafely } = require('./rank-card');
 const { grantMilestoneRoles } = require('./level-rewards');
 const { buildLevelRolePanel, buildLevelRoleList, buildProgressBar } = require('./leveling-ui');
-const { resetGuildAfterConfirmation } = require('./level-admin');
-const musicManager = createMusicManager();
+const { resetGuildAfterConfirmation, activeResetMessages } = require('./level-admin');
+const { createVoiceXpTracker } = require('./voice-xp');
+const { createEconomyStore, createGiveawayStore, createTicketStore } = require('./nightmare-services');
+const { handleEconomy, handleEconomyAdmin, handleItemAdmin, handleAdventure, handleEconomyAutocomplete, handleGiveawayCreate, handleGiveawayButton, finishDueGiveaways, handleTicketCommand, handleTicketButton } = require('./nightmare-interactions');
+const { createNotificationStore, handleNotifyCommand, handleMemberNotification, retryPendingNotifications } = require('./notification-system');
+const { createPlaygroundService, handlePlaygroundCommand } = require('./playground-system');
+const { createTicketDeletionScheduler } = require('./ticket-deletion');
+let voiceXpTracker;
+const musicManager = createMusicManager({
+  onVoiceActivity: (guildId, userId, channelId) => {
+    const member = client.guilds.cache.get(guildId)?.members.cache.get(userId);
+    if (!member || member.user.bot || member.voice.channelId !== channelId) return;
+    voiceXpTracker?.markActive(guildId, userId, channelId, 'voice');
+  },
+  onVoiceMonitorEnd: (guildId, channelId) => voiceXpTracker?.clearChannel(guildId, channelId)
+});
 const playlistStore = createPlaylistStore(path.join(__dirname, 'data', 'playlists.json'));
 const xpStore = createXpStore(path.join(__dirname, 'data', 'xp.json'));
+const economyStore = createEconomyStore(path.join(__dirname, 'data', 'economy.json'));
+const giveawayStore = createGiveawayStore(path.join(__dirname, 'data', 'giveaways.json'));
+const ticketStore = createTicketStore(path.join(__dirname, 'data', 'tickets.json'));
+const notificationStore = createNotificationStore(path.join(__dirname, 'data', 'notifications.json'));
+const playgroundService = createPlaygroundService(economyStore);
+voiceXpTracker = createVoiceXpTracker({
+  award: async (guildId, userId) => {
+    const result = xpStore.awardVoice(guildId, userId);
+    if (!result.awarded) return;
+    if (result.level > result.previousLevel) {
+      const guild = client.guilds.cache.get(guildId);
+      const member = await guild?.members.fetch(userId).catch(() => null);
+      if (guild && member) {
+        await applyLevelRewards(guild, member, result.previousLevel, result.level);
+        await announceLevelUp(guild, member, result.level);
+      }
+    }
+  },
+  disconnect: async (guildId, userId, channelId) => {
+    const guild = client.guilds.cache.get(guildId);
+    const member = await guild?.members.fetch(userId).catch(() => null);
+    if (!member || member.voice.channelId !== channelId) return;
+    const botMember = guild.members.me;
+    const channel = member.voice.channel;
+    if (!channel?.permissionsFor(botMember)?.has(PermissionFlagsBits.MoveMembers)) throw new Error('Bot tidak memiliki izin Move Members.');
+    await member.voice.disconnect('AFK 5 menit pada timer XP voice Nightmare');
+  }
+});
 GlobalFonts.registerFromPath(
   path.join(__dirname, 'assets', 'fonts', 'Roboto-Regular.ttf'),
   'Roboto'
@@ -53,6 +99,9 @@ const client = new Client({
     Partials.User
   ]
 });
+const ticketDeletionScheduler = createTicketDeletionScheduler({ store: ticketStore, client });
+const interactionDispatchStartedAt = new WeakMap();
+const activeLeaderboardMessages = new Set();
 
 const template = [
   {
@@ -207,7 +256,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('resetserver')
-    .setDescription('Reset channel dan kategori server')
+    .setDescription('Hapus channel, kategori, dan role yang dapat dikelola bot setelah konfirmasi')
     .setDefaultMemberPermissions(
       PermissionFlagsBits.Administrator
     ),
@@ -391,17 +440,22 @@ const commands = [
     .addUserOption(opt => opt.setName('member').setDescription('Member yang ingin dilihat').setRequired(false)),
   new SlashCommandBuilder()
     .setName('card')
-    .setDescription('Lihat fitur dan opsi kartu rank Nightmare'),
+    .setDescription('Lihat kartu rank Nightmare')
+    .addUserOption(opt => opt.setName('member').setDescription('Member yang ingin dilihat').setRequired(false)),
   new SlashCommandBuilder()
     .setName('rewards')
     .setDescription('Lihat milestone role level server'),
   new SlashCommandBuilder()
     .setName('boosters')
-    .setDescription('Lihat XP booster aktif server'),
+    .setDescription('Lihat konfigurasi multiplier XP server'),
   new SlashCommandBuilder()
     .setName('leaderboard')
-    .setDescription('Lihat peringkat XP server')
-    .addIntegerOption(opt => opt.setName('page').setDescription('Halaman peringkat').setMinValue(1).setRequired(false)),
+    .setDescription('Lihat peringkat XP server'),
+  new SlashCommandBuilder()
+    .setName('xpboost')
+    .setDescription('Atur XP akhir untuk setiap aktivitas valid')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addIntegerOption(opt => opt.setName('amount').setDescription('XP per aktivitas (1–500)').setMinValue(1).setMaxValue(500).setRequired(true)),
   new SlashCommandBuilder()
     .setName('level-config')
     .setDescription('Atur leveling server')
@@ -440,8 +494,24 @@ const commands = [
     .addSubcommand(sub => sub.setName('add').setDescription('Tambahkan XP').addUserOption(opt => opt.setName('member').setDescription('Member target').setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('XP yang ditambahkan').setMinValue(1).setMaxValue(1_000_000).setRequired(true)))
     .addSubcommand(sub => sub.setName('remove').setDescription('Kurangi XP, minimum nol').addUserOption(opt => opt.setName('member').setDescription('Member target').setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('XP yang dikurangi').setMinValue(1).setMaxValue(1_000_000).setRequired(true)))
     .addSubcommandGroup(group => group.setName('set').setDescription('Tetapkan XP atau level').addSubcommand(sub => sub.setName('xp').setDescription('Tetapkan total XP').addUserOption(opt => opt.setName('member').setDescription('Member target').setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Total XP (0–625.375.000)').setMinValue(0).setMaxValue(625_375_000).setRequired(true))).addSubcommand(sub => sub.setName('level').setDescription('Tetapkan level tepat').addUserOption(opt => opt.setName('member').setDescription('Member target').setRequired(true)).addIntegerOption(opt => opt.setName('level').setDescription('Level tujuan (0–5.000)').setMinValue(0).setMaxValue(5_000).setRequired(true))))
-    .addSubcommandGroup(group => group.setName('reset').setDescription('Reset statistik leveling').addSubcommand(sub => sub.setName('member').setDescription('Reset XP seorang member').addUserOption(opt => opt.setName('member').setDescription('Member target').setRequired(true))).addSubcommand(sub => sub.setName('server').setDescription('Reset XP seluruh member; konfirmasi wajib')))
+    .addSubcommandGroup(group => group.setName('reset').setDescription('Reset statistik leveling').addSubcommand(sub => sub.setName('member').setDescription('Reset XP seorang member').addUserOption(opt => opt.setName('member').setDescription('Member target').setRequired(true))).addSubcommand(sub => sub.setName('server').setDescription('Reset XP seluruh member; konfirmasi wajib'))),
+  new SlashCommandBuilder().setName('giveaway').setDescription('Kelola giveaway server').addSubcommand(sub => sub.setName('create').setDescription('Buat giveaway baru').addStringOption(opt => opt.setName('prize').setDescription('Hadiah giveaway').setMaxLength(200).setRequired(true)).addIntegerOption(opt => opt.setName('minutes').setDescription('Durasi dalam menit').setMinValue(1).setMaxValue(10080).setRequired(true)).addIntegerOption(opt => opt.setName('winners').setDescription('Jumlah pemenang').setMinValue(1).setMaxValue(20).setRequired(true))),
+  new SlashCommandBuilder().setName('economy').setDescription('Kelola saldo dan item Nightmare').addSubcommand(sub => sub.setName('balance').setDescription('Lihat saldo')).addSubcommand(sub => sub.setName('daily').setDescription('Klaim hadiah harian')).addSubcommand(sub => sub.setName('transfer').setDescription('Kirim koin ke member').addUserOption(opt => opt.setName('member').setDescription('Penerima').setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah koin').setMinValue(1).setMaxValue(1000000).setRequired(true))).addSubcommand(sub => sub.setName('shop').setDescription('Lihat katalog shop server')).addSubcommand(sub => sub.setName('buy').setDescription('Beli item katalog').addStringOption(opt => opt.setName('item').setDescription('Item katalog').setAutocomplete(true).setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah 1–1000').setMinValue(1).setMaxValue(1000).setRequired(false))).addSubcommand(sub => sub.setName('sell').setDescription('Jual item dari inventory').addStringOption(opt => opt.setName('item').setDescription('Item yang dimiliki').setAutocomplete(true).setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah 1–1000').setMinValue(1).setMaxValue(1000).setRequired(false))).addSubcommand(sub => sub.setName('inventory').setDescription('Lihat inventory')).addSubcommand(sub => sub.setName('leaderboard').setDescription('Lihat 10 saldo tertinggi')),
+  new SlashCommandBuilder().setName('economy-admin').setDescription('Administrasi saldo dan harga toko').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).addSubcommand(sub => sub.setName('add').setDescription('Tambah saldo member').addUserOption(opt => opt.setName('member').setDescription('Target').setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah').setMinValue(1).setMaxValue(1000000).setRequired(true))).addSubcommand(sub => sub.setName('remove').setDescription('Kurangi saldo member').addUserOption(opt => opt.setName('member').setDescription('Target').setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah').setMinValue(1).setMaxValue(1000000).setRequired(true))).addSubcommand(sub => sub.setName('reset').setDescription('Reset saldo member').addUserOption(opt => opt.setName('member').setDescription('Target').setRequired(true)).addBooleanOption(opt => opt.setName('confirm').setDescription('Konfirmasi reset saldo').setRequired(true))).addSubcommand(sub => sub.setName('price').setDescription('Ubah harga item server').addStringOption(opt => opt.setName('item').setDescription('Item').setAutocomplete(true).setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Harga 1–1.000.000').setMinValue(1).setMaxValue(1000000).setRequired(true))),
+  new SlashCommandBuilder().setName('item').setDescription('Administrasi inventory Economy').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).addSubcommand(sub => sub.setName('give').setDescription('Berikan item').addUserOption(opt => opt.setName('member').setDescription('Target').setRequired(true)).addStringOption(opt => opt.setName('item').setDescription('Item').setAutocomplete(true).setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah').setMinValue(1).setMaxValue(1000).setRequired(true))).addSubcommand(sub => sub.setName('remove').setDescription('Ambil item').addUserOption(opt => opt.setName('member').setDescription('Target').setRequired(true)).addStringOption(opt => opt.setName('item').setDescription('Item').setAutocomplete(true).setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah').setMinValue(1).setMaxValue(1000).setRequired(true))),
+  new SlashCommandBuilder().setName('ticket').setDescription('Kelola tiket bantuan').addSubcommand(sub => sub.setName('setup').setDescription('Konfigurasikan role staf tiket').addRoleOption(opt => opt.setName('staff_role').setDescription('Role yang dapat melihat dan menangani tiket').setRequired(true)).addChannelOption(opt => opt.setName('category').setDescription('Kategori channel tiket').addChannelTypes(ChannelType.GuildCategory).setRequired(false))).addSubcommand(sub => sub.setName('panel').setDescription('Kirim panel pembukaan tiket')).addSubcommand(sub => sub.setName('close').setDescription('Tutup tiket di channel ini')).addSubcommand(sub => sub.setName('reopen').setDescription('Buka kembali tiket di channel ini'))
+  ,new SlashCommandBuilder().setName('notify').setDescription('Konfigurasikan notifikasi server').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addSubcommand(sub => sub.setName('configure').setDescription('Atur channel, role, dan event member').addChannelOption(opt => opt.setName('channel').setDescription('Channel tujuan notification').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(true)).addBooleanOption(opt => opt.setName('joins').setDescription('Kirim notifikasi member bergabung').setRequired(true)).addBooleanOption(opt => opt.setName('leaves').setDescription('Kirim notifikasi member keluar').setRequired(true)).addRoleOption(opt => opt.setName('role').setDescription('Role opsional untuk mention').setRequired(false))).addSubcommand(sub => sub.setName('send').setDescription('Kirim pengumuman ke channel terkonfigurasi').addStringOption(opt => opt.setName('message').setDescription('Isi pengumuman').setMaxLength(1800).setRequired(true))),
+  new SlashCommandBuilder().setName('playground').setDescription('Mainkan game sederhana dan menangkan coin').addSubcommand(sub => sub.setName('guess-start').setDescription('Mulai tebak angka (3 kesempatan)').addIntegerOption(opt => opt.setName('stake').setDescription('Entry fee opsional (0–100)').setMinValue(0).setMaxValue(100).setRequired(false))).addSubcommand(sub => sub.setName('guess').setDescription('Kirim tebakan untuk game milikmu').addStringOption(opt => opt.setName('game_id').setDescription('ID dari guess-start').setMinLength(17).setMaxLength(20).setRequired(true)).addIntegerOption(opt => opt.setName('number').setDescription('Tebakan 1–10').setMinValue(1).setMaxValue(10).setRequired(true))).addSubcommand(sub => sub.setName('trivia-start').setDescription('Mulai trivia satu pertanyaan').addIntegerOption(opt => opt.setName('stake').setDescription('Entry fee opsional (0–100)').setMinValue(0).setMaxValue(100).setRequired(false))).addSubcommand(sub => sub.setName('answer').setDescription('Jawab trivia milikmu').addStringOption(opt => opt.setName('game_id').setDescription('ID dari trivia-start').setMinLength(17).setMaxLength(20).setRequired(true)).addIntegerOption(opt => opt.setName('choice').setDescription('Nomor jawaban 1–4').setMinValue(1).setMaxValue(4).setRequired(true))).addSubcommand(sub => sub.setName('flip').setDescription('Coin flip dengan taruhan 1–100 coin').addStringOption(opt => opt.setName('choice').setDescription('Tebak sisi koin').addChoices({ name: 'Heads', value: 'heads' }, { name: 'Tails', value: 'tails' }).setRequired(true)).addIntegerOption(opt => opt.setName('stake').setDescription('Taruhan 1–100 coin').setMinValue(1).setMaxValue(100).setRequired(true)))
 ].map(command => command.toJSON());
+
+commands.push(new SlashCommandBuilder().setName('adventure').setDescription('Petualangan Guild Nightmare')
+  .addSubcommand(sub => sub.setName('register').setDescription('Daftar sebagai petualang').addStringOption(opt => opt.setName('name').setDescription('Nama petualang').setMinLength(1).setMaxLength(32).setRequired(true)))
+  .addSubcommand(sub => sub.setName('profile').setDescription('Lihat profil petualang'))
+  .addSubcommand(sub => sub.setName('inventory').setDescription('Lihat inventory Economy'))
+  .addSubcommand(sub => sub.setName('materials').setDescription('Lihat material crafting'))
+  .addSubcommand(sub => sub.setName('recipes').setDescription('Lihat resep crafting'))
+  .addSubcommand(sub => sub.setName('craft').setDescription('Buat item dengan material').addStringOption(opt => opt.setName('item').setDescription('Item resep').setAutocomplete(true).setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah 1–100').setMinValue(1).setMaxValue(100).setRequired(false)))
+  .toJSON());
 
 
 // NIGHTMARE_REALTIME_SERVER_STATUS
@@ -531,9 +601,37 @@ client.once('clientReady', async () => {
   }
 });
 
+client.once('clientReady', () => {
+  const recoverGiveaways = () => finishDueGiveaways(client, giveawayStore);
+  void recoverGiveaways();
+  setInterval(recoverGiveaways, 15_000);
+});
+
+client.once('clientReady', () => {
+  const retryNotifications = () => retryPendingNotifications(client, notificationStore);
+  void retryNotifications();
+  setInterval(retryNotifications, 5_000);
+});
+
+client.once('clientReady', () => {
+  const recovered = ticketDeletionScheduler.recover();
+  console.log(`[TICKET] Jadwal penghapusan dipulihkan: ${recovered} tiket.`);
+});
+
 
 function safeDiscordText(value) {
   return String(value).replace(/@/g, '@\u200b').replace(/([\\`*_{}\[\]()#+\-.!|>~])/g, '\\$1');
+}
+
+function safeErrorDiagnostic(error) {
+  const name = /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(error?.name || '') ? error.name : 'Error';
+  const code = Number.isInteger(error?.code) ? error.code : 'none';
+  const message = String(error?.message || 'tidak ada pesan')
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[URL disembunyikan]')
+    .replace(/(authorization|cookie|token|signature|sig|key)=([^\s&]+)/gi, '$1=[disembunyikan]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [disembunyikan]')
+    .slice(0, 500);
+  return `type=${name} code=${code} message=${message}`;
 }
 
 function requireGuild(interaction) {
@@ -560,18 +658,59 @@ async function requireMusicVoice(interaction) {
 
 async function handleLevelCommand(interaction) {
   let deferred = false;
+  let acknowledgmentAttempted = false;
+  let stage = 'pre-ack';
+  const handlerStartedAt = performance.now();
+  const dispatchStartedAt = interactionDispatchStartedAt.get(interaction) ?? handlerStartedAt;
+  const interactionCreatedAt = Number.isFinite(interaction.createdTimestamp)
+    ? interaction.createdTimestamp
+    : handlerStartedAt;
+  let deferLatencyMs = 'pending';
+  const logInteractionFailure = (failedStage, error) => {
+    const errorName = /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(error?.name || '') ? error.name : 'Error';
+    const errorCode = Number.isInteger(error?.code)
+      ? error.code
+      : (typeof error?.code === 'string' && /^[A-Z0-9_]{1,32}$/.test(error.code) ? error.code : 'none');
+    const replied = typeof interaction.replied === 'boolean' ? interaction.replied : 'unknown';
+    const isDeferred = typeof interaction.deferred === 'boolean' ? interaction.deferred : 'unknown';
+    console.error(
+      `[XP] handleLevelCommand stage=${failedStage} command=${interaction.commandName} ` +
+      `elapsedMs=${Math.max(0, Date.now() - interactionCreatedAt)} ` +
+      `handlerEntryDelayMs=${Math.max(0, handlerStartedAt - dispatchStartedAt).toFixed(1)} ` +
+      `interactionAgeAtHandlerEntryMs=${Math.max(0, Date.now() - interactionCreatedAt)} deferLatencyMs=${deferLatencyMs} ` +
+      `deferred=${deferred || isDeferred === true ? true : isDeferred} replied=${replied} ` +
+      `errorType=${errorName} discordCode=${errorCode}`
+    );
+  };
+
   try {
-    const guild = requireGuild(interaction);
+    // Acknowledge immediately: Discord's interaction token expires quickly, and
+    // no guild lookup, option parsing, member fetch, or rendering may precede it.
     const command = interaction.commandName;
-    const adminCommands = ['level-config', 'level-rewards', 'give-xp', 'give-level', 'remove-xp', 'remove-level', 'xp'];
+    const adminCommands = ['level-config', 'level-rewards', 'give-xp', 'give-level', 'remove-xp', 'remove-level', 'xp', 'xpboost'];
+    stage = 'deferReply';
+    acknowledgmentAttempted = true;
+    const deferStartedAt = performance.now();
+    try {
+      if (adminCommands.includes(command)) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      else await interaction.deferReply();
+      deferred = true;
+    } finally {
+      deferLatencyMs = Math.max(0, performance.now() - deferStartedAt).toFixed(1);
+    }
+
+    const guild = requireGuild(interaction);
     if (adminCommands.includes(command) &&
         !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
       throw new Error('Hanya administrator yang dapat mengatur fitur leveling atau XP member.');
     }
-    const adminOnly = adminCommands.includes(command);
-    if (adminOnly) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    else await interaction.deferReply();
-    deferred = true;
+    stage = 'command';
+
+    if (command === 'xpboost') {
+      const amount = interaction.options.getInteger('amount', true);
+      xpStore.setActivityXp(guild.id, amount);
+      return await interaction.editReply(`✅ Boost XP server diatur ke **${amount} XP** per aktivitas valid.`);
+    }
 
     if (['give-xp', 'give-level', 'remove-xp', 'remove-level'].includes(command)) {
       const selectedUser = interaction.options.getUser('member', true);
@@ -587,12 +726,14 @@ async function handleLevelCommand(interaction) {
       };
       const result = operations[command].apply();
       if (result.stats.level > result.previousStats.level || (result.rewardFromLevel < 0 && result.stats.level === 0)) {
-        await applyLevelRewards(guild, member, result.rewardFromLevel, result.stats.level);
+        result.rewardOutcome = await applyLevelRewards(guild, member, result.rewardFromLevel, result.stats.level);
       }
       const appliedText = result.applied === amount ? '' : ` (yang dapat diterapkan: ${result.applied})`;
+      const skippedRewards = result.rewardOutcome?.skipped?.length || 0;
       return await interaction.editReply(
         `✅ ${operations[command].action} untuk <@${member.id}>${appliedText}. Level sekarang **${result.stats.level}**, total **${result.stats.totalXp.toLocaleString('en-US')} XP**.\n` +
-        'Perubahan admin tidak memicu pengumuman. Milestone baru yang dilewati diberikan; role lama tidak dicabut.'
+        'Perubahan admin tidak memicu pengumuman. Milestone baru diproses; role lama tidak dicabut.' +
+        (skippedRewards ? ` ${skippedRewards} role reward tidak dapat diberikan; periksa log bot.` : '')
       );
     }
 
@@ -632,14 +773,16 @@ async function handleLevelCommand(interaction) {
       const isAdminIncrease = (group === null && subcommand === 'add') ||
         (group === 'set' && (subcommand === 'xp' ? interaction.options.getInteger('amount', true) > 0 : interaction.options.getInteger('level', true) > 0));
       if (isAdminIncrease && (result.stats.level > result.previousStats.level || (result.rewardFromLevel < 0 && result.stats.level === 0))) {
-        await applyLevelRewards(guild, member, result.rewardFromLevel, result.stats.level);
+        result.rewardOutcome = await applyLevelRewards(guild, member, result.rewardFromLevel, result.stats.level);
       }
+      const skippedRewards = result.rewardOutcome?.skipped?.length || 0;
       return await interaction.editReply(
-        `✅ XP <@${member.id}> diperbarui. Level **${result.stats.level}**, total **${result.stats.totalXp.toLocaleString('en-US')} XP**. Perubahan admin tidak mengirim pengumuman level-up; role milestone yang memenuhi syarat diberikan dan role lama tidak dicabut.`
+        `✅ XP <@${member.id}> diperbarui. Level **${result.stats.level}**, total **${result.stats.totalXp.toLocaleString('en-US')} XP**. Perubahan admin tidak mengirim pengumuman level-up; role milestone baru diproses dan role lama tidak dicabut.` +
+        (skippedRewards ? ` ${skippedRewards} role reward tidak dapat diberikan; periksa log bot.` : '')
       );
     }
 
-    if (command === 'level' || command === 'rank') {
+    if (command === 'level' || command === 'rank' || command === 'card') {
       const selectedUser = interaction.options.getUser('member');
       const member = await guild.members.fetch(selectedUser?.id || interaction.user.id);
       if (member.user.bot) throw new Error('Rank XP hanya tersedia untuk member manusia.');
@@ -649,11 +792,13 @@ async function handleLevelCommand(interaction) {
         const embed = new EmbedBuilder()
           .setColor(0x7c3aed)
           .setTitle(`🌒 Level · ${member.displayName || member.user.username}`)
-          .setDescription(`${buildProgressBar(stats.progress)} **${(stats.progress * 100).toFixed(1)}%** menuju level berikutnya`)
+          .setDescription(stats.level >= 9999
+            ? `${buildProgressBar(stats.progress)} **Level maksimum tercapai. XP tetap bertambah dan tidak direset.**`
+            : `${buildProgressBar(stats.progress)} **${(stats.progress * 100).toFixed(1)}%** menuju level berikutnya`)
           .addFields(
             { name: 'Level', value: String(stats.level), inline: true },
             { name: 'Total XP', value: stats.totalXp.toLocaleString('en-US'), inline: true },
-            { name: 'Progres XP', value: `${stats.currentLevelXp.toLocaleString('en-US')} / ${stats.xpToNextLevel.toLocaleString('en-US')}`, inline: true },
+            { name: 'Progres XP', value: stats.level >= 9999 ? 'Level maksimum' : `${stats.currentLevelXp.toLocaleString('en-US')} / ${stats.xpToNextLevel.toLocaleString('en-US')}`, inline: true },
             { name: 'Rank Server', value: rank ? `#${rank}` : 'Belum memiliki rank', inline: true }
           );
         return await interaction.editReply({ embeds: [embed] });
@@ -673,13 +818,6 @@ async function handleLevelCommand(interaction) {
       return await interaction.editReply({ embeds: [embed], files: [attachment] });
     }
 
-    if (command === 'card') {
-      return await interaction.editReply({
-        embeds: [new EmbedBuilder().setColor(0x4c1d95).setTitle('Nightmare • Rank Card')
-          .setDescription('Kartu rank memakai desain dark fantasy ungu tetap dan menampilkan avatar, nama, level, total XP, progres, serta rank server. Renderer saat ini tidak menyediakan pengaturan visual per member. Gunakan `/rank` untuk melihat kartu.')]
-      });
-    }
-
     if (command === 'rewards') {
       const rewards = xpStore.getRewards(guild.id);
       const roles = await guild.roles.fetch();
@@ -693,7 +831,7 @@ async function handleLevelCommand(interaction) {
 
     if (command === 'boosters') {
       const boosters = xpStore.getConfig(guild.id).boosters;
-      if (!boosters.length) return await interaction.editReply('Belum ada XP booster aktif di server ini.');
+      if (!boosters.length) return await interaction.editReply('Belum ada konfigurasi multiplier XP di server ini.');
       const [roles, channels] = await Promise.all([guild.roles.fetch(), guild.channels.fetch()]);
       const lines = boosters.map(item => {
         const target = item.type === 'role' ? roles.get(item.targetId) : channels.get(item.targetId);
@@ -701,21 +839,26 @@ async function handleLevelCommand(interaction) {
         return `**${item.type === 'role' ? 'Role' : 'Channel'}** ${label} — **${item.multiplier}×**${target ? '' : ' · nonaktif'} `;
       });
       return await interaction.editReply({
-        embeds: [new EmbedBuilder().setColor(0x4c1d95).setTitle(`Nightmare • XP Boosters · ${guild.name}`).setDescription(lines.join('\n').slice(0, 4000)).setFooter({ text: 'Jika beberapa booster cocok, multiplier tertinggi dipakai; hasil dibulatkan ke XP terdekat.' })],
+        embeds: [new EmbedBuilder().setColor(0x4c1d95).setTitle(`Nightmare • XP Boosters · ${guild.name}`).setDescription(lines.join('\n').slice(0, 4000)).setFooter({ text: 'Multiplier ini tersimpan sebagai konfigurasi; XP per aktivitas saat ini mengikuti nilai /xpboost.' })],
         allowedMentions: { parse: [] }
       });
     }
 
     if (command === 'leaderboard') {
-      const page = interaction.options.getInteger('page') || 1;
-      const result = xpStore.getLeaderboard(guild.id, page, 10);
-      if (!result.total) return await interaction.editReply('Belum ada XP di server ini. Kirim pesan yang memenuhi syarat untuk memulai.');
-      if (page > result.totalPages) throw new Error(`Halaman maksimal saat ini ${result.totalPages}.`);
+      let page = 1;
+      const getPagePayload = async currentPage => {
+      const full = xpStore.getLeaderboard(guild.id, currentPage, 10);
+      const totalPages = Math.min(10, Math.ceil(full.total / 10));
+      const result = { ...full, entries: full.entries.slice(0, 100), totalPages };
+      if (!result.total) return { content: 'Belum ada XP di server ini. Kirim pesan yang memenuhi syarat untuk memulai.' };
+      if (currentPage > result.totalPages) throw new Error(`Halaman maksimal saat ini ${result.totalPages}.`);
       const entries = await Promise.all(result.entries.map(async item => ({
         ...item,
         member: await guild.members.fetch(item.userId).catch(() => null)
       })));
-      const description = entries.map(item =>
+      const visibleEntries = entries.filter(item => !item.member?.user?.bot);
+      if (!visibleEntries.length) return { content: 'Belum ada member manusia di leaderboard server ini.', components: [] };
+      const description = visibleEntries.map(item =>
         `**#${item.rank}** ${item.member ? `<@${item.userId}>` : `Member keluar (${item.userId})`} — Level **${item.level}** · **${item.totalXp.toLocaleString('en-US')} XP**`
       ).join('\n');
       const embed = new EmbedBuilder()
@@ -723,7 +866,39 @@ async function handleLevelCommand(interaction) {
         .setTitle(`🌒 Nightmare Leaderboard · ${guild.name}`)
         .setDescription(description)
         .setFooter({ text: `Halaman ${result.page}/${result.totalPages} · ${result.total} member` });
-      return await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('lb_previous').setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(currentPage <= 1),
+        new ButtonBuilder().setCustomId('lb_next').setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(currentPage >= totalPages)
+      );
+      return { embeds: [embed], components: [row], allowedMentions: { parse: [] } };
+      };
+      const firstPayload = await getPagePayload(page);
+      const reply = await interaction.editReply(firstPayload);
+      if (!reply.components?.length) return;
+      activeLeaderboardMessages.add(reply.id);
+      const collector = reply.createMessageComponentCollector({ time: 120_000 });
+      collector.on('collect', async button => {
+        if (button.user.id !== interaction.user.id) {
+          try {
+            await button.reply({ content: 'Hanya pemanggil command yang dapat memakai tombol ini.', flags: MessageFlags.Ephemeral });
+          } catch (error) {
+            console.warn(`[XP] Leaderboard unauthorized button response failed ${safeErrorDiagnostic(error)}`);
+          }
+          return;
+        }
+        try {
+          await button.deferUpdate();
+          page = Math.max(1, Math.min(10, page + (button.customId === 'lb_next' ? 1 : -1)));
+          await interaction.editReply(await getPagePayload(page));
+        } catch (error) {
+          console.error(`[XP] Leaderboard pagination gagal guild=${guild.id}: ${error.message}`);
+        }
+      });
+      collector.on('end', async () => {
+        activeLeaderboardMessages.delete(reply.id);
+        try { await interaction.editReply({ components: [] }); } catch (error) { console.warn(`[XP] Gagal menutup tombol leaderboard guild=${guild.id}: ${error.message}`); }
+      });
+      return;
     }
 
     if (command === 'level-config') {
@@ -738,7 +913,7 @@ async function handleLevelCommand(interaction) {
           `**Pengumuman level-up:** ${announcement}\n` +
           `**Channel dikecualikan:** ${excluded}\n` +
           `**Role reward:** ${config.rewards.length}\n` +
-          `**XP booster:** ${config.boosters.length} (multiplier tertinggi yang cocok)`
+          `**Konfigurasi multiplier legacy:** ${config.boosters.length} (XP aktivitas mengikuti /xpboost)`
         );
       }
       if (action === 'enabled') {
@@ -861,9 +1036,29 @@ async function handleLevelCommand(interaction) {
       }
     }
   } catch (error) {
-    const content = ('❌ ' + error.message).slice(0, 1900);
-    if (deferred) return await interaction.editReply(content);
-    return await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    logInteractionFailure(stage, error);
+    const content = ('❌ ' + (error?.message || 'Terjadi kesalahan.')).slice(0, 1900);
+
+    if (interaction.replied) return;
+    if (error?.code === 10062 || error?.code === 40060) return;
+    if (deferred || interaction.deferred) {
+      try {
+        return await interaction.editReply(content);
+      } catch (editError) {
+        logInteractionFailure('editReply-after-' + stage, editError);
+        return;
+      }
+    }
+
+    // A failed deferReply may mean Discord has already invalidated this interaction.
+    // Do not send a second initial response after that acknowledgment attempt.
+    if (acknowledgmentAttempted && !interaction.deferred && !interaction.replied) return;
+
+    try {
+      return await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    } catch (replyError) {
+      logInteractionFailure('reply-fallback', replyError);
+    }
   }
 }
 
@@ -879,62 +1074,103 @@ async function applyLevelRewards(guild, member, previousLevel, level) {
   }
 }
 
-async function announceLevelUp(message, level) {
-  const config = xpStore.getConfig(message.guild.id);
-  if (!config.announcement.enabled) return;
-  let channel = null;
-  if (config.announcement.channelId) {
-    channel = message.guild.channels.cache.get(config.announcement.channelId) ||
-      await message.guild.channels.fetch(config.announcement.channelId).catch(() => null);
-  } else {
-    const isLevelingChannel = item => item?.name === '📈・leveling' && item.isTextBased() && typeof item.send === 'function';
-    channel = message.guild.channels.cache.find(isLevelingChannel);
-    if (!channel) {
-      const channels = await message.guild.channels.fetch();
-      channel = channels.find(isLevelingChannel);
-    }
-  }
-  if (!channel || channel.guildId !== message.guild.id || !channel.isTextBased() || typeof channel.send !== 'function') {
-    console.warn(`[XP] Channel pengumuman tidak tersedia guild=${message.guild.id}`);
-    return;
-  }
+function adventurerRankForLevel(level) {
+  if (!Number.isInteger(level) || level < 1 || level > 9999) return null;
+  if (level <= 40) return 'F';
+  if (level <= 85) return 'E';
+  if (level <= 150) return 'D';
+  if (level <= 300) return 'C';
+  if (level <= 600) return 'B';
+  if (level <= 3000) return 'A';
+  return 'S';
+}
+
+async function announceLevelUp(guild, member, level) {
   try {
+    const config = xpStore.getConfig(guild.id);
+    if (!config.announcement.enabled) return;
+    let channel = null;
+    if (config.announcement.channelId) {
+      channel = guild.channels.cache.get(config.announcement.channelId) ||
+        await guild.channels.fetch(config.announcement.channelId).catch(() => null);
+    } else {
+      const isLevelingChannel = item => item?.name === '📈・leveling' && item.isTextBased() && typeof item.send === 'function';
+      channel = guild.channels.cache.find(isLevelingChannel);
+      if (!channel) {
+        const channels = await guild.channels.fetch();
+        channel = channels.find(isLevelingChannel);
+      }
+    }
+    if (!channel || channel.guildId !== guild.id || !channel.isTextBased() || typeof channel.send !== 'function') {
+      console.warn(`[XP] Channel pengumuman tidak tersedia guild=${guild.id}`);
+      return;
+    }
+
+    const adventurerRank = adventurerRankForLevel(level);
+    if (!adventurerRank) throw new Error(`Level untuk rank petualang tidak valid: ${level}`);
+    const serverRank = xpStore.getRank(guild.id, member.id);
+    const serverRankLabel = serverRank ? `#${serverRank}` : '—';
+    const username = member.displayName || member.user.username;
+    const rankMessage = adventurerRank === 'S'
+      ? 'Anda telah sampai Rank S! Selamat, kamu sudah mendapatkan tingkat tertinggi. Silakan lanjutkan sampai max level.'
+      : `Anda telah mencapai Rank ${adventurerRank}. Terus level up untuk mencapai Rank S dan mendapatkan Rewards lebih banyak.`;
+    const content = `Selamat <@${member.id}> kamu sudah mencapai Level ${level}!\n${rankMessage}\nPeringkat leaderboard server terbaru: **${serverRankLabel}**.`;
+    const rendered = await renderRankCardSafely({
+      variant: 'level-up',
+      username,
+      avatarUrl: member.displayAvatarURL({ extension: 'png', size: 256 }),
+      level,
+      adventurerRank,
+      serverRankLabel,
+      message: rankMessage
+    });
+    if (rendered.error || !rendered.buffer) {
+      console.error(`[XP] Kartu level-up gagal dirender guild=${guild.id} user=${member.id}: ${rendered.error?.message || 'buffer kosong'}`);
+      await channel.send({ content, allowedMentions: { users: [member.id] } });
+      return;
+    }
     await channel.send({
-      content: `🌒 <@${message.author.id}> menembus **Level ${level}**. Kegelapan mengakui kekuatanmu.`,
-      allowedMentions: { users: [message.author.id] }
+      content,
+      files: [new AttachmentBuilder(rendered.buffer, { name: 'nightmare-level-up.png' })],
+      allowedMentions: { users: [member.id] }
     });
   } catch (error) {
-    console.warn(`[XP] Gagal mengirim pengumuman guild=${message.guild.id} channel=${channel.id}: ${error.message}`);
+    console.warn(`[XP] Gagal mengirim notifikasi level-up guild=${guild?.id || 'unknown'} user=${member?.id || 'unknown'}: ${error.message}`);
   }
 }
 
 async function processXpMessage(message) {
   try {
+    if (message.member?.voice?.channelId) voiceXpTracker.markActive(message.guild.id, message.author.id, message.member.voice.channelId, 'chat');
     const result = xpStore.awardMessage(message);
     if (!result.awarded) return;
     const member = message.member || await message.guild.members.fetch(message.author.id);
     if (result.level > result.previousLevel || (result.rewardFromLevel < 0 && result.level === 0)) {
       await applyLevelRewards(message.guild, member, result.rewardFromLevel, result.level);
     }
-    if (result.level > result.previousLevel) await announceLevelUp(message, result.level);
+    if (result.level > result.previousLevel) await announceLevelUp(message.guild, member, result.level);
   } catch (error) {
     console.error(`[XP] Gagal memproses pesan guild=${message.guild?.id || 'unknown'} user=${message.author?.id || 'unknown'}: ${error.message}`);
   }
 }
 
+
 async function handleMusicCommand(interaction) {
   let deferred = false;
+  let acknowledgmentAttempted = false;
   try {
-    const guild = requireGuild(interaction);
     const name = interaction.commandName;
+    acknowledgmentAttempted = true;
+    await interaction.deferReply(name === 'play' ? {} : { flags: MessageFlags.Ephemeral });
+    deferred = true;
+    const guild = requireGuild(interaction);
     if (name === 'play') {
-      await interaction.deferReply();
-      deferred = true;
       const { channel } = await requireMusicVoice(interaction);
       const query = interaction.options.getString('query', true);
       const result = await musicManager.enqueue(guild, channel, query, interaction.user, {
         onError: async error => {
-          try { await interaction.followUp({ content: '❌ ' + error.message.slice(0, 1800), flags: MessageFlags.Ephemeral }); } catch {}
+          try { await interaction.followUp({ content: '❌ ' + error.message.slice(0, 1800), flags: MessageFlags.Ephemeral }); }
+          catch (followUpError) { console.warn('[MUSIC] Gagal mengirim error follow-up:', safeErrorDiagnostic(followUpError)); }
         }
       });
       const position = Math.max(1, result.position);
@@ -944,8 +1180,6 @@ async function handleMusicCommand(interaction) {
         (result.track.spotifyUrl ? ' (metadata dari Spotify)' : '') + '.');
     }
     if (name === 'pause' || name === 'resume' || name === 'skip' || name === 'stop' || name === 'dc' || name === 'volume') {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      deferred = true;
       await requireMusicVoice(interaction);
       if (name === 'pause') { musicManager.pause(guild.id); return await interaction.editReply('⏸️ Pemutaran dijeda.'); }
       if (name === 'resume') { musicManager.resume(guild.id); return await interaction.editReply('▶️ Pemutaran dilanjutkan.'); }
@@ -962,7 +1196,6 @@ async function handleMusicCommand(interaction) {
       return await interaction.editReply('🔊 Volume server sekarang **' + volume + '%**.');
     }
     if (name === 'queue' || name === 'nowplaying') {
-      requireGuild(interaction);
       const snapshot = musicManager.getSnapshot(guild.id);
       if (!snapshot.current && !snapshot.queue.length) throw new Error('Tidak ada lagu yang sedang diputar atau diantrekan.');
       if (name === 'nowplaying') {
@@ -971,10 +1204,10 @@ async function handleMusicCommand(interaction) {
         if (!track) throw new Error('Lagu sedang disiapkan; coba lagi sebentar.');
         const requester = entry.requester || 'Tidak diketahui';
         const duration = track.duration ? formatDuration(track.duration) : 'Tidak diketahui';
-        return await interaction.reply({ content: '🎵 **[' + safeDiscordText(track.title) + '](' + track.webpageUrl + ')**' +
+        return await interaction.editReply({ content: '🎵 **[' + safeDiscordText(track.title) + '](' + track.webpageUrl + ')**' +
           (track.artist ? '\nArtis: ' + safeDiscordText(track.artist) : '') + '\nPeminta: ' + safeDiscordText(requester) +
           '\nDurasi: ' + duration + '\nSumber: ' + (track.spotifyUrl ? '[YouTube audio](<' + track.webpageUrl + '>) · [Spotify metadata](<' + track.spotifyUrl + '>)' : '[YouTube](<' + track.webpageUrl + '>)'),
-          flags: MessageFlags.Ephemeral });
+          });
       }
       const lines = [];
       if (snapshot.current) {
@@ -987,22 +1220,26 @@ async function handleMusicCommand(interaction) {
           (entry.requester ? ' — diminta ' + safeDiscordText(entry.requester) : ''));
       }
       if (snapshot.queue.length > 15) lines.push('… dan ' + (snapshot.queue.length - 15) + ' lagu lain.');
-      return await interaction.reply({ content: lines.join('\n').slice(0, 1900), flags: MessageFlags.Ephemeral });
+      return await interaction.editReply({ content: lines.join('\n').slice(0, 1900) });
     }
   } catch (error) {
+    if (error?.code === 10062 || error?.code === 40060) return;
     const message = '❌ ' + error.message;
     if (deferred) return await interaction.editReply(message.slice(0, 1900));
+    if (acknowledgmentAttempted || error?.code === 10062 || error?.code === 40060) return;
     return await interaction.reply({ content: message.slice(0, 1900), flags: MessageFlags.Ephemeral });
   }
 }
 
 async function handlePlaylistCommand(interaction) {
   let deferred = false;
+  let acknowledgmentAttempted = false;
   try {
-    const guild = requireGuild(interaction);
-    const action = interaction.options.getSubcommand();
+    acknowledgmentAttempted = true;
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     deferred = true;
+    const guild = requireGuild(interaction);
+    const action = interaction.options.getSubcommand();
     if (action === 'play') await requireMusicVoice(interaction);
     if (action === 'create') {
       const playlist = playlistStore.create(guild.id, interaction.options.getString('name', true));
@@ -1046,14 +1283,20 @@ async function handlePlaylistCommand(interaction) {
       return await interaction.editReply('🎶 **' + playlist.name + '** (' + playlist.items.length + ' lagu) ditambahkan ke antrean sesuai urutan.');
     }
   } catch (error) {
+    if (error?.code === 10062 || error?.code === 40060) return;
     if (deferred) return await interaction.editReply(('❌ ' + error.message).slice(0, 1900));
+    if (acknowledgmentAttempted || error?.code === 10062 || error?.code === 40060) return;
     return await interaction.reply({ content: ('❌ ' + error.message).slice(0, 1900), flags: MessageFlags.Ephemeral });
   }
 }
 
 async function handleLyricsCommand(interaction) {
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  let deferred = false;
+  let acknowledgmentAttempted = false;
   try {
+    acknowledgmentAttempted = true;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    deferred = true;
     const result = await searchLyrics(
       interaction.options.getString('song', true),
       interaction.options.getString('artist') || ''
@@ -1062,7 +1305,10 @@ async function handleLyricsCommand(interaction) {
     return await interaction.editReply('🎼 **' + safeDiscordText(result.title) + '** — ' + safeDiscordText(result.artist) +
       '\nLihat lirik di sumber resmi: [' + result.source + '](<' + result.url + '>). Bot hanya menampilkan metadata dan tautan, bukan menyalin lirik.');
   } catch (error) {
-    return await interaction.editReply(('❌ ' + error.message).slice(0, 1900));
+    if (error?.code === 10062 || error?.code === 40060) return;
+    if (deferred) return await interaction.editReply(('❌ ' + error.message).slice(0, 1900));
+    if (acknowledgmentAttempted || error?.code === 10062 || error?.code === 40060) return;
+    return await interaction.reply({ content: ('❌ ' + error.message).slice(0, 1900), flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -1070,8 +1316,12 @@ async function handleBotProfileCommand(interaction) {
   if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
     return await interaction.reply({ content: '❌ Hanya administrator yang dapat mengubah profil bot.', flags: MessageFlags.Ephemeral });
   }
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  let deferred = false;
+  let acknowledgmentAttempted = false;
   try {
+    acknowledgmentAttempted = true;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    deferred = true;
     const action = interaction.options.getSubcommand();
     if (action === 'name') {
       const name = interaction.options.getString('name', true).trim();
@@ -1099,17 +1349,76 @@ async function handleBotProfileCommand(interaction) {
     }
     return await interaction.editReply('✅ Nama dan avatar dikembalikan ke nama serta ikon aplikasi. Perubahan tunduk pada rate limit Discord.');
   } catch (error) {
-    return await interaction.editReply(('❌ Gagal memperbarui profil: ' + error.message).slice(0, 1900));
+    if (error?.code === 10062 || error?.code === 40060) return;
+    if (deferred) return await interaction.editReply(('❌ Gagal memperbarui profil: ' + error.message).slice(0, 1900));
+    if (acknowledgmentAttempted || error?.code === 10062 || error?.code === 40060) return;
+    return await interaction.reply({ content: ('❌ Gagal memperbarui profil: ' + error.message).slice(0, 1900), flags: MessageFlags.Ephemeral });
   }
 }
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
 
-  if (
-    interaction.customId !== 'nightmare_reset_confirm' &&
-    interaction.customId !== 'nightmare_reset_cancel'
-  ) return;
+  if (interaction.customId === 'nightmare_giveaway_enter') {
+    return await handleGiveawayButton(interaction, giveawayStore);
+  }
+  if (interaction.customId.startsWith('nightmare_ticket:')) {
+    return await handleTicketButton(interaction, ticketStore, {
+      onClosed: (guildId, channelId) => ticketDeletionScheduler.schedule(guildId, channelId),
+      onReopened: (guildId, channelId) => ticketDeletionScheduler.cancel(guildId, channelId)
+    });
+  }
+
+  if (['lb_previous', 'lb_next'].includes(interaction.customId) &&
+      !activeLeaderboardMessages.has(interaction.message?.id)) {
+    try {
+      await interaction.reply({ content: 'Tombol leaderboard ini sudah kedaluwarsa. Jalankan kembali /leaderboard.', flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      console.warn('[XP] Tombol leaderboard kedaluwarsa tidak dapat ditanggapi:', safeErrorDiagnostic(error));
+    }
+    return;
+  }
+
+  const xpResetAction = interaction.customId.match(/^xp-reset:(confirm|cancel):(\d{17,20}):(\d{17,20})$/);
+  if (xpResetAction && !activeResetMessages.has(interaction.message?.id)) {
+    try {
+      await interaction.reply({ content: 'Konfirmasi reset XP ini sudah kedaluwarsa. Jalankan kembali /xp reset server jika masih diperlukan.', flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      console.warn('[XP] Konfirmasi reset kedaluwarsa tidak dapat ditanggapi:', safeErrorDiagnostic(error));
+    }
+    return;
+  }
+  if (xpResetAction && (interaction.user.id !== xpResetAction[3] ||
+      !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator))) {
+    try {
+      await interaction.reply({ content: 'Hanya administrator yang memulai reset ini yang dapat mengonfirmasinya.', flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      console.warn('[XP] Tombol reset server ditolak tetapi tidak dapat ditanggapi:', safeErrorDiagnostic(error));
+    }
+    return;
+  }
+
+  const resetAction = interaction.customId.match(/^nightmare_reset_(confirm|cancel):(\d{17,20})$/);
+  if (!resetAction) {
+    if (interaction.customId === 'nightmare_reset_confirm' || interaction.customId === 'nightmare_reset_cancel') {
+      try {
+        await interaction.reply({ content: 'Tombol reset ini sudah kedaluwarsa. Jalankan kembali /resetserver jika memang diperlukan.', flags: MessageFlags.Ephemeral });
+      } catch (error) {
+        console.error('[RESET SERVER] Tombol lama tidak dapat ditanggapi:', safeErrorDiagnostic(error));
+      }
+    }
+    return;
+  }
+
+  try {
+  const [, action, ownerId] = resetAction;
+
+  if (interaction.user.id !== ownerId) {
+    return await interaction.reply({
+      content: 'Hanya administrator yang memulai reset ini yang dapat mengonfirmasi atau membatalkannya.',
+      flags: MessageFlags.Ephemeral
+    });
+  }
 
   if (!interaction.inGuild()) {
     return interaction.reply({
@@ -1127,8 +1436,8 @@ client.on('interactionCreate', async interaction => {
     });
   }
 
-  if (interaction.customId === 'nightmare_reset_cancel') {
-    return interaction.update({
+  if (action === 'cancel') {
+    return await interaction.update({
       content: 'Reset dibatalkan. Tidak ada perubahan.',
       components: []
     });
@@ -1268,20 +1577,39 @@ client.on('interactionCreate', async interaction => {
       components: []
     });
   } catch (error) {
-    console.error('Reset server gagal:', error);
-
-    return await interaction.editReply({
-      content: '❌ Reset gagal atau terhenti. Periksa log Termux sebelum mencoba lagi.',
-      components: []
-    });
+    const code = Number.isInteger(error?.code) ? error.code : 'none';
+    console.error(`[RESET SERVER] Komponen gagal acknowledged=${interaction.deferred || interaction.replied} ${safeErrorDiagnostic(error)}`);
+    if (code === 10062 || code === 40060) return;
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({
+          content: '❌ Reset gagal atau terhenti. Periksa log bot sebelum mencoba lagi.',
+          components: []
+        });
+      } else {
+        await interaction.reply({ content: '❌ Reset gagal atau terhenti.', flags: MessageFlags.Ephemeral });
+      }
+    } catch (responseError) {
+      console.error(`[RESET SERVER] Respons error code=${Number.isInteger(responseError?.code) ? responseError.code : 'none'}`);
+    }
+  }
+  } catch (error) {
+    const code = Number.isInteger(error?.code) ? error.code : 'none';
+    console.error(`[RESET SERVER] Acknowledgment komponen gagal ${safeErrorDiagnostic(error)}`);
   }
 });
 
 client.on('interactionCreate', async interaction => {
+  interactionDispatchStartedAt.set(interaction, performance.now());
+  if (interaction.isAutocomplete()) {
+    try { return await handleEconomyAutocomplete(interaction); }
+    catch (error) { console.error(`[ECONOMY] Autocomplete gagal: ${error.message}`); if (!interaction.responded) return interaction.respond([]); }
+  }
   if (!interaction.isChatInputCommand()) return;
 
+  let acknowledgmentAttempted = false;
   try {
-    if (['rank', 'level', 'card', 'rewards', 'boosters', 'leaderboard', 'level-config', 'level-rewards', 'give-xp', 'give-level', 'remove-xp', 'remove-level', 'xp'].includes(interaction.commandName)) {
+    if (['rank', 'level', 'card', 'rewards', 'boosters', 'leaderboard', 'level-config', 'level-rewards', 'give-xp', 'give-level', 'remove-xp', 'remove-level', 'xp', 'xpboost'].includes(interaction.commandName)) {
       return await handleLevelCommand(interaction);
     }
     if (['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'nowplaying', 'volume', 'dc'].includes(interaction.commandName)) {
@@ -1293,8 +1621,20 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'reactionrole') {
       return await handleReactionRoleCommand(interaction);
     }
+    if (interaction.commandName === 'giveaway') return await handleGiveawayCreate(interaction, giveawayStore);
+    if (interaction.commandName === 'economy') return await handleEconomy(interaction, economyStore);
+    if (interaction.commandName === 'economy-admin') return await handleEconomyAdmin(interaction, economyStore);
+    if (interaction.commandName === 'item') return await handleItemAdmin(interaction, economyStore);
+    if (interaction.commandName === 'adventure') return await handleAdventure(interaction, economyStore);
+    if (interaction.commandName === 'ticket') return await handleTicketCommand(interaction, ticketStore, {
+      onClosed: (guildId, channelId) => ticketDeletionScheduler.schedule(guildId, channelId),
+      onReopened: (guildId, channelId) => ticketDeletionScheduler.cancel(guildId, channelId)
+    });
+    if (interaction.commandName === 'notify') return await handleNotifyCommand(interaction, notificationStore);
+    if (interaction.commandName === 'playground') return await handlePlaygroundCommand(interaction, playgroundService);
 
     if (interaction.commandName === 'ping') {
+      acknowledgmentAttempted = true;
       return await interaction.reply({
         content: '🏓 Pong! Nightmare aktif!',
         flags: MessageFlags.Ephemeral
@@ -1304,6 +1644,7 @@ client.on('interactionCreate', async interaction => {
 
     if (interaction.commandName === 'resetserver') {
       if (!interaction.inGuild()) {
+        acknowledgmentAttempted = true;
         return await interaction.reply({
           content: 'Perintah ini hanya bisa digunakan di server.',
           flags: MessageFlags.Ephemeral
@@ -1313,6 +1654,7 @@ client.on('interactionCreate', async interaction => {
       if (!interaction.memberPermissions.has(
         PermissionFlagsBits.Administrator
       )) {
+        acknowledgmentAttempted = true;
         return await interaction.reply({
           content: '❌ Hanya administrator server yang bisa melakukan reset.',
           flags: MessageFlags.Ephemeral
@@ -1323,27 +1665,29 @@ client.on('interactionCreate', async interaction => {
 
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-          .setCustomId('nightmare_reset_confirm')
+          .setCustomId('nightmare_reset_confirm:' + interaction.user.id)
           .setLabel('Konfirmasi reset')
           .setStyle(ButtonStyle.Danger),
         new ButtonBuilder()
-          .setCustomId('nightmare_reset_cancel')
+          .setCustomId('nightmare_reset_cancel:' + interaction.user.id)
           .setLabel('Batal')
           .setStyle(ButtonStyle.Secondary)
       );
 
+      acknowledgmentAttempted = true;
       await interaction.deferReply({
         flags: MessageFlags.Ephemeral
       });
 
       return await interaction.editReply({
-        content: '⚠️ **Konfirmasi reset Fallen Heaven**\\nReset belum aktif. Tombol ini hanya untuk menguji konfirmasi; belum ada channel yang akan dihapus.',
+        content: '⚠️ **Reset server bersifat destruktif dan tidak dapat dibatalkan.** Jika dikonfirmasi, bot menghapus semua channel selain `#setup`, semua kategori, dan semua role yang dapat dikelolanya. Pastikan cadangan tersedia sebelum melanjutkan.',
         components: [row]
       });
     }
 
     if (interaction.commandName === 'resetpreview') {
       if (!interaction.inGuild()) {
+        acknowledgmentAttempted = true;
         return await interaction.reply({
           content: 'Perintah ini hanya bisa digunakan di server.',
           flags: MessageFlags.Ephemeral
@@ -1353,12 +1697,14 @@ client.on('interactionCreate', async interaction => {
       if (!interaction.memberPermissions?.has(
         PermissionFlagsBits.Administrator
       )) {
+        acknowledgmentAttempted = true;
         return await interaction.reply({
           content: 'Hanya administrator yang bisa menggunakan perintah ini.',
           flags: MessageFlags.Ephemeral
         });
       }
 
+      acknowledgmentAttempted = true;
       await interaction.deferReply({
         flags: MessageFlags.Ephemeral
       });
@@ -1415,6 +1761,7 @@ client.on('interactionCreate', async interaction => {
 
     if (interaction.commandName === 'bg') {
       if (!interaction.inGuild()) {
+        acknowledgmentAttempted = true;
         return await interaction.reply({
           content: 'Perintah ini hanya bisa digunakan di server.',
           flags: MessageFlags.Ephemeral
@@ -1424,6 +1771,7 @@ client.on('interactionCreate', async interaction => {
       if (!interaction.memberPermissions?.has(
         PermissionFlagsBits.Administrator
       )) {
+        acknowledgmentAttempted = true;
         return await interaction.reply({
           content: '❌ Hanya administrator yang bisa mengatur background.',
           flags: MessageFlags.Ephemeral
@@ -1437,12 +1785,14 @@ client.on('interactionCreate', async interaction => {
       try {
         imageUrl = normalizeMemberCardImageUrl(url);
       } catch (error) {
+        acknowledgmentAttempted = true;
         return await interaction.reply({
           content: '❌ ' + error.message,
           flags: MessageFlags.Ephemeral
         });
       }
 
+      acknowledgmentAttempted = true;
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       try {
@@ -1469,6 +1819,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName !== 'setup') return;
 
     if (!interaction.inGuild()) {
+      acknowledgmentAttempted = true;
       return await interaction.reply({
         content: 'Perintah ini hanya bisa digunakan di server.',
         flags: MessageFlags.Ephemeral
@@ -1478,6 +1829,7 @@ client.on('interactionCreate', async interaction => {
     if (!interaction.memberPermissions.has(
       PermissionFlagsBits.ManageChannels
     )) {
+      acknowledgmentAttempted = true;
       return await interaction.reply({
         content: 'Kamu perlu izin Manage Channels.',
         flags: MessageFlags.Ephemeral
@@ -1485,6 +1837,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     // Respons awal harus dikirim sebelum membuat banyak channel.
+    acknowledgmentAttempted = true;
     await interaction.deferReply({
       flags: MessageFlags.Ephemeral
     });
@@ -1589,11 +1942,12 @@ client.on('interactionCreate', async interaction => {
 
     await interaction.editReply(result);
   } catch (error) {
-    console.error('Interaction error:', error);
+    console.error('Interaction error:', safeErrorDiagnostic(error));
 
     // Jangan membuat crash jika Discord sudah menganggap
     // interaksi kedaluwarsa atau responsnya tidak bisa dikirim.
     if (error.code === 10062 || error.code === 40060) return;
+    if (acknowledgmentAttempted) return;
 
     try {
       if (interaction.deferred || interaction.replied) {
@@ -1607,10 +1961,7 @@ client.on('interactionCreate', async interaction => {
         });
       }
     } catch (replyError) {
-      console.error(
-        'Gagal mengirim respons:',
-        replyError.code || replyError.message
-      );
+      console.error('Gagal mengirim respons:', safeErrorDiagnostic(replyError));
     }
   }
 });
@@ -1622,8 +1973,14 @@ const TEMPVOICE_PREFIX = '🔊・';
 const tempVoiceRooms = new Set();
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
-  console.log('[TEMPVOICE] event:', oldState.channel?.name, '->', newState.channel?.name);
   try {
+    if (oldState.channelId !== newState.channelId) {
+      if (oldState.channelId) voiceXpTracker.clear(newState.guild.id, newState.id);
+      if (newState.channelId && !newState.member?.user?.bot) {
+        voiceXpTracker.start(newState.guild.id, newState.id, newState.channelId);
+      }
+    }
+    console.log('[TEMPVOICE] event:', oldState.channel?.name, '->', newState.channel?.name);
     const guild = newState.guild || oldState.guild;
     if (!guild) return;
 
@@ -1692,7 +2049,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 // END NIGHTMARE_TEMPVOICE
 
 client.on('error', error => {
-  console.error('Discord client error:', error);
+  console.error('Discord client error:', safeErrorDiagnostic(error));
 });
 
 
@@ -2034,6 +2391,12 @@ client.on(Events.GuildMemberAdd, async member => {
   }
 });
 
+client.on(Events.GuildMemberAdd, member => {
+  void handleMemberNotification(member, 'join', notificationStore).catch(error =>
+    console.error(`[NOTIFY] Join event guild=${member.guild?.id || 'unknown'} user=${member.id}: ${error.message}`)
+  );
+});
+
 client.on(Events.GuildMemberRemove, async member => {
   try {
     const channel = await findMemberCardChannel(member.guild);
@@ -2048,12 +2411,21 @@ client.on(Events.GuildMemberRemove, async member => {
   }
 });
 
+client.on(Events.GuildMemberRemove, member => {
+  void handleMemberNotification(member, 'leave', notificationStore).catch(error =>
+    console.error(`[NOTIFY] Leave event guild=${member.guild?.id || 'unknown'} user=${member.id}: ${error.message}`)
+  );
+});
+
 client.on(Events.MessageCreate, async message => {
   if (!xpStore.isEligibleMessage(message)) return;
-  void processXpMessage(message);
+  // XP persistence uses synchronous JSON work. Yield once so queued gateway
+  // interactions can be dispatched and acknowledged before that work begins.
+  setImmediate(() => { void processXpMessage(message); });
 
   const command = message.content.trim().toLowerCase();
   if (command !== '^^welcome' && command !== '^^goodbye') return;
+  if (!message.member?.permissions.has(PermissionFlagsBits.Administrator)) return;
 
   try {
     const member = await message.guild.members.fetch(message.author.id);
@@ -2378,8 +2750,12 @@ async function handleReactionRoleCommand(interaction) {
     });
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  let deferred = false;
+  let acknowledgmentAttempted = false;
   try {
+    acknowledgmentAttempted = true;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    deferred = true;
     const guild = interaction.guild;
     const subcommand = interaction.options.getSubcommand();
 
@@ -2415,9 +2791,11 @@ async function handleReactionRoleCommand(interaction) {
         saveReactionRoleData(data);
       } catch (error) {
         if (reaction) {
-          try { await reaction.users.remove(client.user.id); } catch {}
+          try { await reaction.users.remove(client.user.id); }
+          catch (cleanupError) { console.warn('[REACTION ROLE] Gagal membersihkan reaction panel:', safeErrorDiagnostic(cleanupError)); }
         }
-        try { await message.delete(); } catch {}
+        try { await message.delete(); }
+        catch (cleanupError) { console.warn('[REACTION ROLE] Gagal menghapus panel yang tidak tersimpan:', safeErrorDiagnostic(cleanupError)); }
         throw new Error('Gagal memasang reaction atau menyimpan konfigurasi: ' + error.message);
       }
       return await interaction.editReply(
@@ -2504,8 +2882,10 @@ async function handleReactionRoleCommand(interaction) {
           latestData.reactionRoles[latestIndex] = updatedPanel;
           saveReactionRoleData(latestData);
         } catch (error) {
-          try { await message.edit({ embeds: [oldEmbed] }); } catch {}
-          try { await reaction.users.remove(client.user.id); } catch {}
+          try { await message.edit({ embeds: [oldEmbed] }); }
+          catch (cleanupError) { console.warn('[REACTION ROLE] Gagal mengembalikan embed setelah add gagal:', safeErrorDiagnostic(cleanupError)); }
+          try { await reaction.users.remove(client.user.id); }
+          catch (cleanupError) { console.warn('[REACTION ROLE] Gagal membersihkan reaction setelah add gagal:', safeErrorDiagnostic(cleanupError)); }
           throw new Error('Mapping tidak jadi ditambahkan: ' + error.message);
         }
         return '✅ Ditambahkan ke panel: ' + reaction.emoji.toString() + ' → <@&' + role.id + '>.';
@@ -2556,7 +2936,8 @@ async function handleReactionRoleCommand(interaction) {
           );
           saveReactionRoleData(latestData);
         } catch (error) {
-          try { await message.edit({ embeds: [oldEmbed] }); } catch {}
+          try { await message.edit({ embeds: [oldEmbed] }); }
+          catch (cleanupError) { console.warn('[REACTION ROLE] Gagal mengembalikan embed setelah remove gagal:', safeErrorDiagnostic(cleanupError)); }
           throw new Error('Mapping tidak jadi dihapus: ' + error.message);
         }
 
@@ -2613,8 +2994,14 @@ async function handleReactionRoleCommand(interaction) {
       return await interaction.editReply(result);
     }
   } catch (error) {
-    console.error('[REACTION ROLE] Perintah gagal:', error.message);
-    return await interaction.editReply('❌ ' + error.message);
+    if (error?.code === 10062 || error?.code === 40060) {
+      console.error('[REACTION ROLE] Acknowledgment/response Discord gagal:', safeErrorDiagnostic(error));
+      return;
+    }
+    console.error('[REACTION ROLE] Perintah gagal:', safeErrorDiagnostic(error));
+    if (deferred || interaction.deferred) return await interaction.editReply('❌ ' + error.message);
+    if (acknowledgmentAttempted || interaction.replied) return;
+    return await interaction.reply({ content: '❌ ' + error.message, flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -2686,7 +3073,8 @@ async function processReactionRoleEvent(reactionInput, userInput, adding) {
         item.mappings.some(candidate => candidate.emojiKey === mapping.emojiKey && candidate.roleId === role.id)
       );
       if (!stillMapped) {
-        try { await member.roles.remove(role, 'Reaction role mapping was removed'); } catch {}
+        try { await member.roles.remove(role, 'Reaction role mapping was removed'); }
+        catch (cleanupError) { console.error('[REACTION ROLE] Gagal mencabut role setelah mapping dihapus:', safeErrorDiagnostic(cleanupError)); }
         return;
       }
       if (!latestData.grants.some(matchesGrant)) {
@@ -2700,7 +3088,8 @@ async function processReactionRoleEvent(reactionInput, userInput, adding) {
         try {
           saveReactionRoleData(latestData);
         } catch (error) {
-          try { await member.roles.remove(role, 'Reaction role grant could not be saved'); } catch {}
+          try { await member.roles.remove(role, 'Reaction role grant could not be saved'); }
+          catch (cleanupError) { console.error('[REACTION ROLE] Grant tidak tersimpan dan role gagal dipulihkan:', safeErrorDiagnostic(cleanupError)); }
           throw error;
         }
       }

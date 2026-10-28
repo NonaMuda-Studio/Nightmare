@@ -2,11 +2,12 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { randomUUID, randomInt } = require('node:crypto');
+const { randomUUID } = require('node:crypto');
 
-const XP_MIN = 15;
+const XP_MIN = 25;
 const XP_MAX = 25;
 const DEFAULT_COOLDOWN_MS = 60_000;
+const MAX_LEVEL = 9999;
 const MAX_REWARD_LEVEL = 500;
 const MAX_REWARDS_PER_GUILD = 25;
 const MAX_ADMIN_XP_ADJUSTMENT = 1_000_000;
@@ -26,25 +27,42 @@ function validateId(value, label) {
 }
 
 function xpRequiredForLevel(level) {
-  if (!Number.isInteger(level) || level < 0) throw new Error('Level harus bilangan bulat nonnegatif.');
-  // Total XP threshold: 100 XP for level 1, then +50 XP per level.
-  return 25 * level * level + 75 * level;
+  if (!Number.isInteger(level) || level < 0 || level > MAX_LEVEL + 1) throw new Error('Level tujuan harus 0–10000.');
+  return level === 0 ? 0n : 100n * (2n ** BigInt(level - 1));
 }
 
+// The requested cost is exponential per target level. Cumulative thresholds sum
+// those costs, so XP totals quickly exceed Number's exact range; keep them BigInt.
+function cumulativeXpForLevel(level) {
+  if (!Number.isInteger(level) || level < 0 || level > MAX_LEVEL) throw new Error(`Level tujuan harus 0–${MAX_LEVEL}.`);
+  return level === 0 ? 0n : 100n * ((2n ** BigInt(level)) - 1n);
+}
+
+function xpBigInt(value) {
+  if (typeof value === 'bigint' && value >= 0n) return value;
+  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value);
+  if (Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  throw new Error('Total XP tidak valid.');
+}
+function storedXp(value) { return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString(); }
+
 function calculateProgress(totalXp) {
-  if (!Number.isSafeInteger(totalXp) || totalXp < 0) throw new Error('Total XP tidak valid.');
-  let level = Math.max(0, Math.floor((Math.sqrt(5625 + 100 * totalXp) - 75) / 50));
-  while (xpRequiredForLevel(level + 1) <= totalXp) level++;
-  while (xpRequiredForLevel(level) > totalXp) level--;
-  const levelStartXp = xpRequiredForLevel(level);
-  const nextLevelXp = xpRequiredForLevel(level + 1);
+  const xp = xpBigInt(totalXp);
+  let low = 0, high = MAX_LEVEL;
+  while (low < high) { const mid = Math.ceil((low + high + 1) / 2); if (cumulativeXpForLevel(mid) <= xp) low = mid; else high = mid - 1; }
+  const level = low;
+  const levelStartXp = cumulativeXpForLevel(level);
+  const nextLevelXp = level === MAX_LEVEL ? levelStartXp : cumulativeXpForLevel(level + 1);
+  const current = xp - levelStartXp;
+  const needed = nextLevelXp - levelStartXp;
+  const publicValue = value => value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value;
   return {
-    totalXp,
+    totalXp: publicValue(xp),
     level,
-    currentLevelXp: totalXp - levelStartXp,
-    xpToNextLevel: nextLevelXp - levelStartXp,
-    nextLevelAt: nextLevelXp,
-    progress: (totalXp - levelStartXp) / (nextLevelXp - levelStartXp)
+    currentLevelXp: publicValue(current),
+    xpToNextLevel: publicValue(needed),
+    nextLevelAt: publicValue(nextLevelXp),
+    progress: level === MAX_LEVEL ? 1 : Number(current * 1_000_000n / needed) / 1_000_000
   };
 }
 
@@ -60,9 +78,7 @@ function createXpStore(filePath, options = {}) {
   if (typeof filePath !== 'string' || !filePath) throw new Error('Lokasi file XP harus berupa path.');
   const cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
   const seenMessageIds = new Set();
-  const randomXp = options.randomXp || (() => randomInt(XP_MIN, XP_MAX + 1));
   if (!Number.isSafeInteger(cooldownMs) || cooldownMs < 0) throw new Error('Cooldown XP tidak valid.');
-  if (typeof randomXp !== 'function') throw new Error('Generator XP harus berupa fungsi.');
 
   function emptyData() { return { version: 1, guilds: {} }; }
   function emptyGuild() {
@@ -73,6 +89,7 @@ function createXpStore(filePath, options = {}) {
       rewards: [],
       boosters: [],
       levelPanel: null,
+      activityXp: 25,
       processedMessageIds: [],
       members: {}
     };
@@ -82,6 +99,7 @@ function createXpStore(filePath, options = {}) {
     validateId(guildId, 'Guild ID');
     if (!guild || typeof guild !== 'object' || Array.isArray(guild)) throw new Error(`Data guild ${guildId} tidak valid.`);
     if (typeof guild.enabled !== 'boolean') throw new Error(`Pengaturan enabled guild ${guildId} tidak valid.`);
+    if (!Number.isInteger(guild.activityXp ?? 25) || (guild.activityXp ?? 25) < 1 || (guild.activityXp ?? 25) > 500) throw new Error(`Pengaturan XP aktivitas guild ${guildId} tidak valid.`);
     if (!guild.announcement || typeof guild.announcement !== 'object' || Array.isArray(guild.announcement) ||
         typeof guild.announcement.enabled !== 'boolean' ||
         (guild.announcement.channelId !== null && guild.announcement.channelId !== undefined && !SNOWFLAKE_PATTERN.test(guild.announcement.channelId))) {
@@ -124,7 +142,7 @@ function createXpStore(filePath, options = {}) {
     if (!guild.members || typeof guild.members !== 'object' || Array.isArray(guild.members)) throw new Error(`Data member guild ${guildId} tidak valid.`);
     for (const [userId, member] of Object.entries(guild.members)) {
       validateId(userId, 'User ID');
-      if (!member || typeof member !== 'object' || Array.isArray(member) || !Number.isSafeInteger(member.xp) || member.xp < 0 ||
+      if (!member || typeof member !== 'object' || Array.isArray(member) || (() => { try { xpBigInt(member.xp); return false; } catch { return true; } })() ||
           !(member.lastMessageAt === null || (Number.isSafeInteger(member.lastMessageAt) && member.lastMessageAt >= 0))) {
         throw new Error(`Statistik member ${userId} pada guild ${guildId} tidak valid.`);
       }
@@ -150,6 +168,7 @@ function createXpStore(filePath, options = {}) {
         if (!Object.hasOwn(guild, 'boosters')) guild.boosters = [];
         if (!Object.hasOwn(guild, 'levelPanel')) guild.levelPanel = null;
         if (!Object.hasOwn(guild, 'processedMessageIds')) guild.processedMessageIds = [];
+        if (!Object.hasOwn(guild, 'activityXp')) guild.activityXp = 25;
       }
       validateGuild(guildId, guild);
     }
@@ -196,12 +215,18 @@ function createXpStore(filePath, options = {}) {
       rewards: guild.rewards.map(item => ({ ...item })),
       boosters: guild.boosters.map(item => ({ ...item })),
       levelPanel: guild.levelPanel ? { ...guild.levelPanel } : null
+      ,activityXp: guild.activityXp ?? 25
     };
   }
 
   function setEnabled(guildId, enabled) {
     if (typeof enabled !== 'boolean') throw new Error('Status leveling harus berupa true atau false.');
     return mutateGuild(guildId, guild => { guild.enabled = enabled; return enabled; });
+  }
+
+  function setActivityXp(guildId, amount) {
+    if (!Number.isInteger(amount) || amount < 1 || amount > 500) throw new Error('XP per aktivitas harus bilangan bulat 1–500.');
+    return mutateGuild(guildId, guild => { guild.activityXp = amount; return amount; });
   }
 
   function setAnnouncement(guildId, channelId) {
@@ -276,13 +301,14 @@ function createXpStore(filePath, options = {}) {
       const existingMember = guild.members[userId];
       const member = existingMember || { xp: 0, lastMessageAt: null };
       const before = member.xp;
-      const after = direction === 'add' ? before + amount : Math.max(0, before - amount);
-      if (!Number.isSafeInteger(after)) throw new Error('Total XP melebihi batas aman.');
+      const beforeBig = xpBigInt(before);
+      const afterBig = direction === 'add' ? beforeBig + BigInt(amount) : (beforeBig > BigInt(amount) ? beforeBig - BigInt(amount) : 0n);
+      const after = storedXp(afterBig);
       member.xp = after;
       guild.members[userId] = member;
       return {
         requested: amount,
-        applied: direction === 'add' ? after - before : before - after,
+        applied: Number(direction === 'add' ? afterBig - beforeBig : beforeBig - afterBig),
         isNewMember: !existingMember,
         rewardFromLevel: (!existingMember || (direction === 'add' && calculateProgress(before).level === 0 && guild.rewards.some(item => item.level === 0))) ? -1 : calculateProgress(before).level,
         previousStats: statsFor(before, member.lastMessageAt),
@@ -303,9 +329,9 @@ function createXpStore(filePath, options = {}) {
         ? previousStats.level + amount
         : Math.max(0, previousStats.level - amount);
       if (!Number.isSafeInteger(targetLevel)) throw new Error('Level tujuan melebihi batas aman.');
-      const targetXp = xpRequiredForLevel(targetLevel);
-      if (!Number.isSafeInteger(targetXp)) throw new Error('XP untuk level tujuan melebihi batas aman.');
-      member.xp = targetXp;
+      const targetXp = cumulativeXpForLevel(targetLevel);
+      const storedTargetXp = targetXp <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(targetXp) : targetXp.toString();
+      member.xp = storedTargetXp;
       guild.members[userId] = member;
       return {
         requested: amount,
@@ -339,11 +365,15 @@ function createXpStore(filePath, options = {}) {
 
   function setLevel(guildId, userId, level) {
     validateId(userId, 'User ID');
-    if (!Number.isSafeInteger(level) || level < 0 || level > MAX_ADMIN_LEVEL_VALUE) throw new Error(`Level harus 0–${MAX_ADMIN_LEVEL_VALUE}.`);
-    const xp = xpRequiredForLevel(level);
-    if (!Number.isSafeInteger(xp)) throw new Error('XP untuk level tujuan melebihi batas aman.');
-    const result = setXp(guildId, userId, xp);
-    return { ...result, requestedLevel: level };
+    if (!Number.isSafeInteger(level) || level < 0 || level > MAX_LEVEL) throw new Error(`Level harus 0–${MAX_LEVEL}.`);
+    const xp = cumulativeXpForLevel(level);
+    return mutateGuild(guildId, guild => {
+      const prior = guild.members[userId];
+      const previousStats = statsFor(prior?.xp ?? 0, prior?.lastMessageAt ?? null);
+      const total = storedXp(xp);
+      guild.members[userId] = { xp: total, lastMessageAt: prior?.lastMessageAt ?? null };
+      return { previousStats, isNewMember: !prior, rewardFromLevel: previousStats.level, stats: statsFor(total, prior?.lastMessageAt ?? null), requestedLevel: level };
+    });
   }
 
   function resetMember(guildId, userId) {
@@ -423,28 +453,34 @@ function createXpStore(filePath, options = {}) {
     if (!guild.enabled) return { awarded: false, reason: 'disabled' };
     if (channelId && guild.excludedChannelIds.includes(channelId)) return { awarded: false, reason: 'excluded-channel' };
     if (member.lastMessageAt !== null && now - member.lastMessageAt < cooldownMs) return { awarded: false, reason: 'cooldown', stats: statsFor(member.xp, member.lastMessageAt) };
-    const baseXp = randomXp();
-    if (!Number.isInteger(baseXp) || baseXp < XP_MIN || baseXp > XP_MAX) throw new Error(`XP acak harus ${XP_MIN}–${XP_MAX}.`);
-    const memberRoleIds = new Set(message.member?.roles?.cache?.keys ? message.member.roles.cache.keys() : []);
-    const matchingBoosters = guild.boosters.filter(item =>
-      (item.type === 'channel' && item.targetId === channelId) ||
-      (item.type === 'role' && memberRoleIds.has(item.targetId))
-    );
-    const multiplier = matchingBoosters.reduce((max, item) => Math.max(max, item.multiplier), 1);
-    const xpAdded = Math.max(1, Math.round(baseXp * multiplier));
+    const baseXp = guild.activityXp ?? 25;
+    const xpAdded = baseXp;
     const previousLevel = calculateProgress(member.xp).level;
     if (messageId) {
       guild.processedMessageIds.push(messageId);
       if (guild.processedMessageIds.length > MAX_PROCESSED_MESSAGES) guild.processedMessageIds.shift();
     }
-    member.xp += xpAdded;
-    if (!Number.isSafeInteger(member.xp)) throw new Error('Total XP melebihi batas aman.');
+    member.xp = storedXp(xpBigInt(member.xp) + BigInt(xpAdded));
     member.lastMessageAt = now;
     guild.members[userId] = member;
     write(data);
     const stats = statsFor(member.xp, member.lastMessageAt);
     const rewardFromLevel = isNewMember || (previousLevel === 0 && guild.rewards.some(item => item.level === 0)) ? -1 : previousLevel;
-    return { awarded: true, baseXp, xpAdded, multiplier, isNewMember, rewardFromLevel, previousLevel, level: stats.level, stats };
+    return { awarded: true, baseXp, xpAdded, multiplier: 1, isNewMember, rewardFromLevel, previousLevel, level: stats.level, stats };
+  }
+
+  function awardVoice(guildId, userId) {
+    validateId(userId, 'User ID');
+    return mutateGuild(guildId, guild => {
+      if (!guild.enabled) return { awarded: false, reason: 'disabled' };
+      const member = guild.members[userId] || { xp: 0, lastMessageAt: null };
+      const previousLevel = calculateProgress(member.xp).level;
+      const amount = guild.activityXp ?? 25;
+      member.xp = storedXp(xpBigInt(member.xp) + BigInt(amount));
+      guild.members[userId] = member;
+      const stats = statsFor(member.xp, member.lastMessageAt);
+      return { awarded: true, xpAdded: amount, previousLevel, level: stats.level, stats };
+    });
   }
 
   function getLeaderboard(guildId, page = 1, pageSize = 10) {
@@ -453,11 +489,13 @@ function createXpStore(filePath, options = {}) {
     const guild = getGuild(read(), guildId);
     const entries = Object.entries(guild.members)
       .map(([userId, member]) => ({ userId, ...statsFor(member.xp, member.lastMessageAt) }))
-      .sort((a, b) => b.totalXp - a.totalXp || a.userId.localeCompare(b.userId));
-    const totalPages = Math.ceil(entries.length / pageSize);
+      .sort((a, b) => (xpBigInt(b.totalXp) > xpBigInt(a.totalXp) ? 1 : xpBigInt(b.totalXp) < xpBigInt(a.totalXp) ? -1 : 0) || a.userId.localeCompare(b.userId));
+    const ranked = entries.slice(0, 100);
+    const totalPages = Math.ceil(ranked.length / pageSize);
+    if (page > Math.max(1, totalPages)) throw new Error(`Halaman leaderboard maksimal ${Math.max(1, totalPages)}.`);
     return {
-      entries: entries.slice((page - 1) * pageSize, page * pageSize).map((item, index) => ({ ...item, rank: (page - 1) * pageSize + index + 1 })),
-      total: entries.length,
+      entries: ranked.slice((page - 1) * pageSize, page * pageSize).map((item, index) => ({ ...item, rank: (page - 1) * pageSize + index + 1 })),
+      total: ranked.length,
       page,
       pageSize,
       totalPages
@@ -468,7 +506,7 @@ function createXpStore(filePath, options = {}) {
     validateId(userId, 'User ID');
     const data = read();
     const guild = getGuild(data, guildId);
-    const sorted = Object.entries(guild.members).sort((a, b) => b[1].xp - a[1].xp || a[0].localeCompare(b[0]));
+    const sorted = Object.entries(guild.members).sort((a, b) => (xpBigInt(b[1].xp) > xpBigInt(a[1].xp) ? 1 : xpBigInt(b[1].xp) < xpBigInt(a[1].xp) ? -1 : 0) || a[0].localeCompare(b[0]));
     const index = sorted.findIndex(([id]) => id === userId);
     return index === -1 ? null : index + 1;
   }
@@ -479,6 +517,7 @@ function createXpStore(filePath, options = {}) {
     read,
     isEligibleMessage,
     awardMessage,
+    awardVoice,
     getStats,
     giveXp,
     removeXp,
@@ -495,6 +534,7 @@ function createXpStore(filePath, options = {}) {
     getLeaderboard,
     getConfig,
     setEnabled,
+    setActivityXp,
     setAnnouncement,
     updateExcludedChannel,
     addReward,
@@ -507,6 +547,8 @@ module.exports = {
   createXpStore,
   calculateProgress,
   xpRequiredForLevel,
+  cumulativeXpForLevel,
+  xpBigInt,
   isEligibleMessage,
   XP_MIN,
   XP_MAX,

@@ -461,15 +461,25 @@ test('slash command JSON schema builds globally without removing legacy commands
   const end = source.indexOf(marker, start);
   assert.ok(start >= 0 && end >= 0, 'global command array found');
   const snippet = source.slice(start, end + marker.length);
-  const context = { SlashCommandBuilder, PermissionFlagsBits, ChannelType };
+  const context = { SlashCommandBuilder, PermissionFlagsBits, ChannelType, ITEMS: require('../economy-catalog').ITEMS };
   vm.createContext(context);
   vm.runInContext(snippet + '\nthis.result = commands;', context);
+  context.commands = context.result;
+  const adventureStart = source.indexOf("commands.push(new SlashCommandBuilder().setName('adventure')");
+  const adventureEnd = source.indexOf('\n  .toJSON());', adventureStart) + '\n  .toJSON());'.length;
+  assert.ok(adventureStart >= 0 && adventureEnd > adventureStart, 'Adventure command builder found');
+  vm.runInContext(source.slice(adventureStart, adventureEnd), context);
   const commands = context.result;
+  assert.match(source, /createPlaygroundService\(economyStore\)/, 'playground uses the existing economy store');
+  assert.match(source, /handlePlaygroundCommand\(interaction, playgroundService\)/, 'playground slash command is dispatched');
   const names = commands.map(command => command.name);
-  for (const name of ['ping','setup','resetserver','resetpreview','bg','reactionrole','play','pause','resume','skip','stop','queue','nowplaying','volume','dc','playlist','lyrics','botprofile','rank','level','card','rewards','boosters','leaderboard','level-config','level-rewards','give-xp','give-level','remove-xp','remove-level','xp']) {
+  for (const name of ['ping','setup','resetserver','resetpreview','bg','reactionrole','play','pause','resume','skip','stop','queue','nowplaying','volume','dc','playlist','lyrics','botprofile','rank','level','card','rewards','boosters','leaderboard','xpboost','level-config','level-rewards','give-xp','give-level','remove-xp','remove-level','xp','giveaway','economy','economy-admin','item','adventure','ticket','notify','playground']) {
     assert.ok(names.includes(name), 'expected global /' + name);
   }
   assert.equal(new Set(names).size, names.length, 'no duplicate global command names');
+  for (const command of commands) for (const subcommand of command.options.filter(option => option.options)) for (const option of subcommand.options) assert.ok((option.choices || []).length <= 25, `${command.name}/${subcommand.name} choice limit`);
+  const economy = commands.find(command => command.name === 'economy');
+  assert.equal(economy.options.find(option => option.name === 'buy').options.find(option => option.name === 'item').autocomplete, true);
   const playlist = commands.find(command => command.name === 'playlist');
   assert.deepEqual(playlist.options.map(option => option.name), ['create','rename','list','add','remove','play']);
   const profile = commands.find(command => command.name === 'botprofile');
@@ -477,6 +487,11 @@ test('slash command JSON schema builds globally without removing legacy commands
   const reactionrole = commands.find(command => command.name === 'reactionrole');
   assert.deepEqual(reactionrole.options.map(option => option.name), ['create','add','remove','list','delete']);
   const levelConfig = commands.find(command => command.name === 'level-config');
+  const xpboost = commands.find(command => command.name === 'xpboost');
+  assert.equal(xpboost.default_member_permissions, String(PermissionFlagsBits.Administrator));
+  assert.equal(xpboost.options[0].name, 'amount');
+  assert.equal(xpboost.options[0].min_value, 1);
+  assert.equal(xpboost.options[0].max_value, 500);
   const levelRewards = commands.find(command => command.name === 'level-rewards');
   assert.equal(levelConfig.default_member_permissions, String(PermissionFlagsBits.Administrator));
   assert.equal(levelRewards.default_member_permissions, String(PermissionFlagsBits.Administrator));
