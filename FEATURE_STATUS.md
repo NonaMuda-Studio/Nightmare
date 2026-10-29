@@ -111,3 +111,10 @@ Three rank/card test failures had one harness cause: `tests/level-interaction.te
 - Skill levels persist in the existing Economy JSON profile. Passive skills affect combat calculations, active skills consume a combat turn, and the rank B ultimate can be used once per hunt.
 - Service tests exercise actual combat outcomes as well as costs, prerequisites, persistence, authorization, owner/guild, expiry, duplicate actions and ultimate limits. Discord registration/live interaction is not verified; tests use local fixtures and mocks.
 - JSON persistence remains single-process per file and has no cross-process locking.
+
+## Server setup and Real-Time Stats (2026-10-29)
+
+- /setup template:<large|medium|small> now previews the manifest and current channel matches before an owner-bound confirmation. The manifests define the eight required categories and calculate permanent channel totals from entries: Large 95, Medium 50, Small 35. Existing resources are retained; mismatched names/types/locations are reported and skipped.
+- Real-Time Stats runs on one guarded five-minute interval. It fetches members, roles, and channels; counts humans separately from bots, all top-level non-category channels, and fetched roles including @everyone. Failed values are marked unavailable where possible; one missing or failed counter does not stop the others.
+- Temporary Voice continues to use the single existing voice-state listener and the exact ➕・create-voice trigger. Setup room counts exclude dynamically created temporary rooms.
+- Local manifest/setup/status tests use Discord mocks. No live server setup, permission validation, status rename, Temporary Voice session, or Discord API integration was run. Existing categories/channels and permissions were not modified during this work. The setup option can bind a staff role; otherwise the existing ticket staff role is used.

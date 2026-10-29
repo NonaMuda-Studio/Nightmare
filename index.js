@@ -44,6 +44,12 @@ const { SKILLS } = require('./adventure-skills');
 const { TEMPLATE_KEYS, createAnnouncementDraftStore, handleAnnouncementCreate, handleAnnouncementComponent, handleAnnouncementModal } = require('./announcement-studio');
 const { createInteractionDiagnostics, errorResponseAction } = require('./interaction-diagnostics');
 const { RADIO_STATIONS, RADIO_STATION_BY_ID, createRadioStore, hasRadioAdminPermission } = require('./radio-system');
+const { SETUP_MANIFESTS, buildSetupPreview, applySetupManifest, createSetupConfirmationStore, renderSetupPreview, validateSetupStaffRole } = require('./server-setup');
+const { createServerStatusUpdater } = require('./server-status');
+const { registerCommandsUnlessSkipped } = require('./command-registration');
+const { createTemporaryVoiceService } = require('./temporary-voice');
+const { retryIdempotentRead, sendLevelUpOnce, classifyLevelUpDeliveryError } = require('./level-up-delivery');
+const { buildSetupCommand } = require('./setup-command-schema');
 let voiceXpTracker;
 const radioStore = createRadioStore(path.join(__dirname, 'data', 'radio.json'));
 const musicManager = createMusicManager({
@@ -63,6 +69,7 @@ const ticketStore = createTicketStore(path.join(__dirname, 'data', 'tickets.json
 const notificationStore = createNotificationStore(path.join(__dirname, 'data', 'notifications.json'));
 const playgroundService = createPlaygroundService(economyStore);
 const announcementDraftStore = createAnnouncementDraftStore();
+const setupConfirmationStore = createSetupConfirmationStore();
 voiceXpTracker = createVoiceXpTracker({
   award: async (guildId, userId) => {
     const result = xpStore.awardVoice(guildId, userId);
@@ -115,156 +122,12 @@ const interactionDiagnostics = createInteractionDiagnostics();
 const activeLeaderboardMessages = new Set();
 const resetConfirmationGuard = createResetConfirmationGuard();
 
-const template = [
-  {
-    name: '– – ~ 📊 • | SERVER STATS |',
-    channels: [
-      ['👥・all-members', 'text'],
-      ['👤・members', 'text'],
-      ['🤖・bots', 'text'],
-      ['💬・channels', 'text'],
-      ['🎭・roles', 'text']
-    ]
-  },
-  {
-    name: '– – ~ 📜 • | INFORMATION |',
-    channels: [
-      ['📖・rules', 'text'],
-      ['📢・announcements', 'announcement'],
-      ['🎭・getroles', 'text'],
-      ['👋・welcome-goodbye', 'text'],
-      ['📌・server-guide', 'text'],
-      ['🗞️・community-news', 'announcement']
-    ]
-  },
-  {
-    name: '– – ~ 🌐 • | GENERAL |',
-    channels: [
-      ['💬・global-chat', 'text'],
-      ['🌏・international-chat', 'text'],
-      ['😂・memes', 'text'],
-      ['🤖・bot-commands', 'text'],
-      ['📈・leveling', 'text'],
-      ['🤔・questions', 'text'],
-      ['🌙・daily-chat', 'text'],
-      ['📸・media-share', 'text'],
-      ['🎉・introductions', 'text'],
-      ['🤝・meet-the-community', 'text'],
-      ['☕・off-topic', 'text'],
-      ['💭・random-chat', 'text']
-    ]
-  },
-  {
-    name: '– – ~ 💠 • | COMMUNITY |',
-    channels: [
-      ['💡・suggestions', 'forum'],
-      ['🚨・report-leak', 'text'],
-      ['🎫・support-ticket', 'text'],
-      ['📊・community-polls', 'text'],
-      ['🗓️・community-events', 'text'],
-      ['🏆・achievements', 'text'],
-      ['🎁・giveaways', 'text'],
-      ['🤝・partnerships', 'text'],
-      ['🙋・ask-the-staff', 'text'],
-      ['📮・feedback', 'forum']
-    ]
-  },
-  {
-    name: '– – ~ 🎮 • | GAMING |',
-    channels: [
-      ['🕹️・game-chat', 'text'],
-      ['📰・game-updates', 'announcement'],
-      ['🔎・find-teammates', 'text'],
-      ['🎯・looking-for-group', 'text'],
-      ['🎬・game-clips', 'text'],
-      ['🧠・game-guides', 'forum'],
-      ['🏅・ranked-talk', 'text'],
-      ['🎲・other-games', 'text'],
-      ['📷・game-screenshots', 'text'],
-      ['🏆・tournament-talk', 'text']
-    ]
-  },
-  {
-    name: '– – ~ 🎨 • | MEDIA & SHOWCASE |',
-    channels: [
-      ['🖼️・showcase', 'text'],
-      ['🎨・fanart', 'forum'],
-      ['📷・photography', 'text'],
-      ['🎞️・video-share', 'text'],
-      ['✍️・creative-writing', 'forum'],
-      ['🌟・featured-creations', 'text']
-    ]
-  },
-  {
-    name: '– – ~ 🗂️ • | FORUM HUB |',
-    channels: [
-      ['💬・general-discussions', 'forum'],
-      ['❓・help-forum', 'forum'],
-      ['📚・tutorials', 'forum'],
-      ['💭・ideas-and-feedback', 'forum']
-    ]
-  },
-  {
-    name: '– – ~ 📢 • | ANNOUNCEMENTS |',
-    channels: [
-      ['📢・server-announcements', 'announcement'],
-      ['🎮・game-announcements', 'announcement'],
-      ['🎉・event-announcements', 'announcement']
-    ]
-  },
-  {
-    name: '– – ~ 🔊 • | VOICE LOUNGE |',
-    channels: [
-      ['🔊・general-vc', 'voice'],
-      ['🎮・gaming-vc', 'voice'],
-      ['🎙️・creator-channel', 'voice'],
-      ['👥・community-vc', 'voice'],
-      ['🔒・private-lounge', 'voice'],
-      ['➕・create-voice', 'voice']
-    ]
-  },
-  {
-    name: '– – ~ 🎵 • | MUSIC LOUNGE |',
-    channels: [
-      ['🎧・request-music', 'text'],
-      ['🎵・music-commands', 'text'],
-      ['🎶・music-room-01', 'voice'],
-      ['🎼・music-room-02', 'voice']
-    ]
-  },
-  {
-    name: '– – ~ 🛡️ • | STAFF & LOGS |',
-    channels: [
-      ['🛡️・staff-chat', 'text'],
-      ['🔨・mod-logs', 'text'],
-      ['🚫・ban-logs', 'text'],
-      ['👢・kick-logs', 'text'],
-      ['🔓・unban-logs', 'text'],
-      ['📋・staff-notes', 'text'],
-      ['🎫・ticket-logs', 'text'],
-      ['🤖・bot-logs', 'text']
-    ]
-  }
-];
-
-const channelTypes = {
-  text: ChannelType.GuildText,
-  announcement: ChannelType.GuildAnnouncement,
-  forum: ChannelType.GuildForum,
-  voice: ChannelType.GuildVoice
-};
-
 const commands = [
   new SlashCommandBuilder()
     .setName('ping')
     .setDescription('Cek apakah Nightmare aktif'),
 
-  new SlashCommandBuilder()
-    .setName('setup')
-    .setDescription('Buat struktur server Fallen Heaven')
-    .setDefaultMemberPermissions(
-      PermissionFlagsBits.ManageChannels
-    ),
+  buildSetupCommand(),
 
   new SlashCommandBuilder()
     .setName('resetserver')
@@ -554,87 +417,27 @@ commands.push(new SlashCommandBuilder().setName('announcement').setDescription('
 
 
 // NIGHTMARE_REALTIME_SERVER_STATUS
-async function updateServerStatus() {
-  console.log('[STATUS] Mulai update...');
-  for (const guild of client.guilds.cache.values()) {
-    try {
-      console.log('[STATUS] Mengambil channel:', guild.name);
-      const channels = await guild.channels.fetch();
-      console.log('[STATUS] Channel didapat:', channels.size);
-      const category = channels.find(c =>
-        c.type === ChannelType.GuildCategory &&
-        c.name.toLowerCase().includes('server stats')
-      );
-
-      if (!category) {
-        console.log(`[STATUS] Kategori tidak ditemukan: ${guild.name}`);
-        continue;
-      }
-
-      console.log('[STATUS] Mengambil member...');
-      const members = await guild.members.fetch();
-      console.log('[STATUS] Member didapat:', members.size);
-      const humans = members.filter(m => !m.user.bot).size;
-      const bots = members.filter(m => m.user.bot).size;
-      const totalChannels = channels.filter(c =>
-        c.type !== ChannelType.GuildCategory
-      ).size;
-      const totalRoles = (await guild.roles.fetch()).size;
-
-      const stats = [
-        ['👥・all-members', members.size],
-        ['👤・members', humans],
-        ['🤖・bots', bots],
-        ['💬・channels', totalChannels],
-        ['🎭・roles', totalRoles]
-      ];
-
-      for (const [base, count] of stats) {
-        const ch = channels.find(c =>
-          c.parentId === category.id &&
-          c.type === ChannelType.GuildText &&
-          (c.name === base || c.name.startsWith(base + '・'))
-        );
-
-        if (!ch) {
-          console.log(`[STATUS] Channel tidak ditemukan: ${base}`);
-          continue;
-        }
-
-        const newName = `${base}・${count}`;
-        if (ch.name !== newName) {
-          await ch.setName(newName, 'Nightmare server status');
-          await new Promise(resolve => setTimeout(resolve, 1500));
-        }
-      }
-
-      console.log(`[STATUS] Berhasil diperbarui: ${guild.name}`);
-    } catch (error) {
-      console.error(`[STATUS] Error ${guild.name}:`, error.message);
-    }
-  }
-}
-
-client.once('clientReady', () => {
-  console.log('[STATUS] Sistem status aktif.');
-  updateServerStatus();
-  setInterval(updateServerStatus, 5 * 60 * 1000);
-});
+const serverStatusUpdater = createServerStatusUpdater({ client });
+client.once('clientReady', () => serverStatusUpdater.start());
 // END NIGHTMARE_REALTIME_SERVER_STATUS
 
 client.once('clientReady', async () => {
   console.log(`Bot online: ${client.user.tag}`);
 
   try {
-    const rest = new REST({ version: '10' })
-      .setToken(process.env.DISCORD_TOKEN);
-
-    await rest.put(
-      Routes.applicationCommands(client.application.id),
-      { body: commands }
-    );
-
-    console.log('Slash commands dikirim ke Discord:', commands.map(c => '/' + c.name).join(', '));
+    await registerCommandsUnlessSkipped({
+      env: process.env,
+      logger: console,
+      register: async () => {
+        const rest = new REST({ version: '10' })
+          .setToken(process.env.DISCORD_TOKEN);
+        await rest.put(
+          Routes.applicationCommands(client.application.id),
+          { body: commands }
+        );
+        console.log('Slash commands dikirim ke Discord:', commands.map(c => '/' + c.name).join(', '));
+      }
+    });
   } catch (error) {
     console.error('Gagal mendaftarkan perintah:', error.message);
   }
@@ -982,7 +785,8 @@ async function handleLevelCommand(interaction) {
           );
         return await interaction.editReply({ embeds: [embed] });
       }
-      const rendered = await renderRankCardSafely({
+      stage = 'card-render';
+    const rendered = await renderRankCardSafely({
         username: member.displayName || member.user.username,
         avatarUrl: member.displayAvatarURL({ extension: 'png', size: 256 }),
         stats,
@@ -1265,18 +1069,24 @@ function adventurerRankForLevel(level) {
 }
 
 async function announceLevelUp(guild, member, level) {
+  let stage = 'configuration';
   try {
     const config = xpStore.getConfig(guild.id);
     if (!config.announcement.enabled) return;
     let channel = null;
+    stage = 'channel-lookup';
+    const retryOptions = {
+      attempts: 2,
+      onRetry: ({ attempt, error }) => console.warn(`[XP] Retry aman pembacaan channel level-up guild=${guild.id} attempt=${attempt} class=${classifyLevelUpDeliveryError(error)}`)
+    };
     if (config.announcement.channelId) {
       channel = guild.channels.cache.get(config.announcement.channelId) ||
-        await guild.channels.fetch(config.announcement.channelId).catch(() => null);
+        await retryIdempotentRead(() => guild.channels.fetch(config.announcement.channelId), retryOptions);
     } else {
       const isLevelingChannel = item => item?.name === '📈・leveling' && item.isTextBased() && typeof item.send === 'function';
       channel = guild.channels.cache.find(isLevelingChannel);
       if (!channel) {
-        const channels = await guild.channels.fetch();
+        const channels = await retryIdempotentRead(() => guild.channels.fetch(), retryOptions);
         channel = channels.find(isLevelingChannel);
       }
     }
@@ -1294,6 +1104,7 @@ async function announceLevelUp(guild, member, level) {
       ? 'Anda telah sampai Rank S! Selamat, kamu sudah mendapatkan tingkat tertinggi. Silakan lanjutkan sampai max level.'
       : `Anda telah mencapai Rank ${adventurerRank}. Terus level up untuk mencapai Rank S dan mendapatkan Rewards lebih banyak.`;
     const content = `Selamat <@${member.id}> kamu sudah mencapai Level ${level}!\n${rankMessage}\nPeringkat leaderboard server terbaru: **${serverRankLabel}**.`;
+    stage = 'card-render';
     const rendered = await renderRankCardSafely({
       variant: 'level-up',
       username,
@@ -1305,16 +1116,19 @@ async function announceLevelUp(guild, member, level) {
     });
     if (rendered.error || !rendered.buffer) {
       console.error(`[XP] Kartu level-up gagal dirender guild=${guild.id} user=${member.id}: ${rendered.error?.message || 'buffer kosong'}`);
-      await channel.send({ content, allowedMentions: { users: [member.id] } });
+      stage = 'message-send';
+      await sendLevelUpOnce(channel, { content, allowedMentions: { users: [member.id] } });
       return;
     }
-    await channel.send({
+    stage = 'message-send';
+    await sendLevelUpOnce(channel, {
       content,
       files: [new AttachmentBuilder(rendered.buffer, { name: 'nightmare-level-up.png' })],
       allowedMentions: { users: [member.id] }
     });
   } catch (error) {
-    console.warn(`[XP] Gagal mengirim notifikasi level-up guild=${guild?.id || 'unknown'} user=${member?.id || 'unknown'}: ${error.message}`);
+    const delivery = stage === 'message-send' ? (error.deliveryClass || classifyLevelUpDeliveryError(error)) : 'not-sent';
+    console.warn(`[XP] Notifikasi level-up gagal guild=${guild?.id || 'unknown'} user=${member?.id || 'unknown'} stage=${stage} delivery=${delivery} ${safeErrorDiagnostic(error)}`);
   }
 }
 
@@ -1549,6 +1363,53 @@ async function handleBotProfileCommand(interaction) {
   }
 }
 
+async function handleSetupComponent(interaction) {
+  const match = /^nightmare_setup:(confirm|cancel):([\da-f-]{36})$/i.exec(interaction.customId || '');
+  if (!match) return false;
+  const [, action, id] = match;
+  try {
+    if (!interaction.inGuild?.() || !interaction.guildId) throw new Error('Setup hanya tersedia di server.');
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) throw new Error('Perlu izin Manage Channels untuk mengonfirmasi setup.');
+    const entry = setupConfirmationStore.get(id, interaction.guildId, interaction.user.id);
+    if (!entry) throw new Error('Preview setup kedaluwarsa atau bukan milikmu. Jalankan /setup kembali.');
+    if (action === 'cancel') {
+      const cancellation = setupConfirmationStore.cancel(id, interaction.guildId, interaction.user.id);
+      if (cancellation === 'claimed') {
+        return await interaction.reply({ content: 'Setup sedang diproses dan tidak dapat dibatalkan lewat tombol ini. Pembatalan tidak menghentikan operasi yang sudah dimulai.', flags: MessageFlags.Ephemeral });
+      }
+      if (cancellation === 'unavailable') throw new Error('Preview setup kedaluwarsa atau bukan milikmu. Jalankan /setup kembali.');
+      if (cancellation === 'already-cancelled') {
+        return await interaction.reply({ content: 'Preview setup ini sudah dibatalkan atau tidak lagi aktif.', flags: MessageFlags.Ephemeral });
+      }
+      return await interaction.update({ content: 'Setup dibatalkan. Tidak ada channel yang diubah.', embeds: [], components: [] });
+    }
+    const claimed = setupConfirmationStore.claim(id, interaction.guildId, interaction.user.id);
+    if (!claimed) throw new Error('Konfirmasi setup sudah digunakan.');
+    await interaction.deferUpdate();
+    const guild = interaction.guild;
+    const me = guild.members.me || await guild.members.fetchMe();
+    if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error('Nightmare tidak memiliki izin Manage Channels.');
+    const staffRoleId = claimed.staffRoleId || null;
+    if (staffRoleId) await validateSetupStaffRole(guild, staffRoleId);
+    const result = await applySetupManifest(guild, SETUP_MANIFESTS[claimed.templateId], { staffRoleId, botId: me.id, expectedPreview: claimed.preview });
+    setupConfirmationStore.finish(id);
+    const actual = result.actualCount === null ? 'tidak dapat dipastikan' : `${result.actualCount}/${SETUP_MANIFESTS[claimed.templateId].permanentChannelCount}`;
+    let text = `**Setup ${SETUP_MANIFESTS[claimed.templateId].name} diproses**
+Kategori dibuat: ${result.madeCategories}
+Channel dibuat dan terverifikasi: ${result.madeChannels}
+Sudah ada/dilewati: ${result.skipped}
+Gagal atau konflik: ${result.failed.length}
+Channel manifest terverifikasi saat pemeriksaan akhir: ${actual}.`;
+    if (!staffRoleId) text += '\nTidak ada role staf tiket terkonfigurasi; kategori privat dapat diakses administrator dan bot saja.';
+    if (result.failed.length) text += `\n\n**Detail (maksimal 8):**\n${result.failed.slice(0, 8).map(item => `• ${item}`).join('\n')}${result.failed.length > 8 ? `\n…dan ${result.failed.length - 8} kendala lain.` : ''}`;
+    return await interaction.editReply({ content: text.slice(0, 1900), embeds: [], components: [] });
+  } catch (error) {
+    if ([10062, 40060].includes(error?.code)) return;
+    if (interaction.deferred || interaction.replied) return await interaction.editReply({ content: `❌ Setup gagal: ${error.message}`.slice(0, 1900), embeds: [], components: [] });
+    return await interaction.reply({ content: `❌ Setup gagal: ${error.message}`.slice(0, 1900), flags: MessageFlags.Ephemeral });
+  }
+}
+
 client.on('interactionCreate', async interaction => {
   interactionDiagnostics.instrument(interaction, 'component-listener');
   try {
@@ -1560,6 +1421,7 @@ client.on('interactionCreate', async interaction => {
   if (interaction.customId?.startsWith('nightmare_announce:')) {
     return await handleAnnouncementComponent(interaction, announcementDraftStore);
   }
+  if (interaction.customId?.startsWith('nightmare_setup:')) return await handleSetupComponent(interaction);
   if (interaction.customId === 'nightmare_giveaway_enter') {
     return await handleGiveawayButton(interaction, giveawayStore);
   }
@@ -1838,6 +1700,7 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
   let acknowledgmentAttempted = false;
+  let setupStage = 'dispatcher';
   try {
     if (['rank', 'level', 'card', 'rewards', 'boosters', 'leaderboard', 'level-config', 'level-rewards', 'give-xp', 'give-level', 'remove-xp', 'remove-level', 'xp', 'xpboost'].includes(interaction.commandName)) {
       return await handleLevelCommand(interaction);
@@ -2050,132 +1913,54 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.commandName !== 'setup') return;
+    setupStage = 'guild-preflight';
 
-    if (!interaction.inGuild()) {
+    if (!interaction.inGuild?.() || !interaction.guildId) {
       acknowledgmentAttempted = true;
-      return await interaction.reply({
-        content: 'Perintah ini hanya bisa digunakan di server.',
-        flags: MessageFlags.Ephemeral
-      });
+      return await interaction.reply({ content: 'Perintah ini hanya bisa digunakan di server.', flags: MessageFlags.Ephemeral });
     }
-
-    if (!interaction.memberPermissions.has(
-      PermissionFlagsBits.ManageChannels
-    )) {
+    setupStage = 'user-permission-preflight';
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) {
       acknowledgmentAttempted = true;
-      return await interaction.reply({
-        content: 'Kamu perlu izin Manage Channels.',
-        flags: MessageFlags.Ephemeral
-      });
+      return await interaction.reply({ content: 'Kamu perlu izin Manage Channels untuk menyiapkan server.', flags: MessageFlags.Ephemeral });
     }
-
-    // Respons awal harus dikirim sebelum membuat banyak channel.
+    setupStage = 'acknowledgment';
     acknowledgmentAttempted = true;
-    await interaction.deferReply({
-      flags: MessageFlags.Ephemeral
-    });
-
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    setupStage = 'template-option';
+    const templateId = interaction.options.getString('template', false);
+    if (!templateId) throw new Error('Schema /setup yang terdaftar belum memiliki opsi template. Minta administrator menyinkronkan slash command sebelum menjalankan setup.');
+    const manifest = SETUP_MANIFESTS[templateId];
+    if (!manifest) throw new Error('Template setup tidak dikenal.');
+    setupStage = 'bot-permission-preflight';
     const guild = interaction.guild;
-    const me = await guild.members.fetchMe();
-
-    if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
-      return await interaction.editReply(
-        '❌ Nightmare perlu izin Manage Channels!'
-      );
+    const me = guild.members.me || await guild.members.fetchMe();
+    if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) return await interaction.editReply('❌ Nightmare perlu izin Manage Channels sebelum setup dapat dimulai.');
+    setupStage = 'preview-resource-fetch';
+    const channels = await guild.channels.fetch();
+    const selectedStaffRole = interaction.options.getRole('staff_role');
+    if (selectedStaffRole && (selectedStaffRole.guild?.id !== guild.id || selectedStaffRole.id === guild.id || selectedStaffRole.managed)) {
+      return await interaction.editReply('❌ Pilih role staf biasa dari server ini; role terkelola dan @everyone tidak dapat digunakan.');
     }
-
-    let madeCategories = 0;
-    let madeChannels = 0;
-    let skipped = 0;
-    const errors = [];
-
-    for (const group of template) {
-      let freshChannels = await guild.channels.fetch();
-
-      let category = freshChannels.find(
-        channel =>
-          channel &&
-          channel.type === ChannelType.GuildCategory &&
-          channel.name === group.name
-      );
-
-      if (!category) {
-        try {
-          category = await guild.channels.create({
-            name: group.name,
-            type: ChannelType.GuildCategory,
-            reason: 'Nightmare Fallen Heaven setup'
-          });
-          madeCategories++;
-
-          // Pastikan kategori yang baru dibuat sudah tersedia.
-          category = await guild.channels.fetch(category.id);
-          if (!category || category.type !== ChannelType.GuildCategory) {
-            throw new Error('Kategori tidak ditemukan setelah dibuat');
-          }
-        } catch (error) {
-          errors.push(`Kategori ${group.name}: ${error.message}`);
-          continue;
-        }
-      }
-
-      for (const [name, kind] of group.channels) {
-        const type = channelTypes[kind];
-
-        const latestChannels = await guild.channels.fetch();
-        const existing = latestChannels.find(
-          channel => channel && channel.name === name
-        );
-
-        if (existing) {
-          if (
-            existing.type === type &&
-            existing.parentId === category.id
-          ) {
-            skipped++;
-          } else {
-            errors.push(
-              `${name}: nama sudah digunakan di tempat lain atau tipenya berbeda`
-            );
-          }
-          continue;
-        }
-
-        try {
-          await guild.channels.create({
-            name,
-            type,
-            parent: category.id,
-            reason: 'Nightmare Fallen Heaven setup'
-          });
-
-          madeChannels++;
-        } catch (error) {
-          errors.push(`${name} (${kind}): ${error.message}`);
-        }
-      }
-    }
-
-    let result =
-      `✅ **Nightmare setup selesai diproses!**\n` +
-      `📂 Kategori dibuat: ${madeCategories}\n` +
-      `🧩 Channel dibuat: ${madeChannels}\n` +
-      `⏭️ Sudah ada: ${skipped}\n` +
-      `⚠️ Gagal atau dilewati: ${errors.length}\n\n` +
-      `Channel lama tidak dihapus.`;
-
-    if (errors.length > 0) {
-      result += '\n\n**Detail kendala:**\n' +
-        errors.slice(0, 8).map(error => `• ${error}`).join('\n');
-
-      if (errors.length > 8) {
-        result += `\n...dan ${errors.length - 8} kendala lainnya.`;
-      }
-    }
-
-    await interaction.editReply(result);
+    const configuredStaffRoleId = selectedStaffRole?.id || ticketStore.configuration(guild.id)?.staffRoleId || null;
+    setupStage = 'preview-build';
+    const preview = buildSetupPreview(manifest, channels, { guildId: guild.id, staffRoleId: configuredStaffRoleId, botId: me.id });
+    const confirmationId = setupConfirmationStore.create({ guildId: guild.id, ownerId: interaction.user.id, templateId: manifest.id, preview, staffRoleId: configuredStaffRoleId });
+    setupStage = 'preview-response';
+    const fields = renderSetupPreview(preview);
+    const embed = new EmbedBuilder()
+      .setTitle(`Preview setup · ${manifest.name}`)
+      .setDescription(`Manifest berisi **${preview.permanentChannelCount} channel permanen** dari 8 kategori. Kategori lama dengan permission tidak aman/berbeda dilewati tanpa perubahan. Baru: **${preview.newChannels}** · sudah sesuai: **${preview.existingChannels}** · konflik/dilewati: **${preview.conflicts}**. Kategori baru: **${preview.newCategories}** · konflik kategori: **${preview.categoryConflicts}**. Channel Temporary Voice yang dibuat dinamis tidak dihitung.`)
+      .setColor(0x5865f2)
+      .addFields(fields);
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`nightmare_setup:confirm:${confirmationId}`).setLabel('Konfirmasi setup').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`nightmare_setup:cancel:${confirmationId}`).setLabel('Batal').setStyle(ButtonStyle.Secondary)
+    );
+    return await interaction.editReply({ content: 'Periksa daftar channel berikut. Tidak ada channel lama yang akan dihapus atau dipindahkan.', embeds: [embed], components: [row] });
   } catch (error) {
     const diagnostic = interactionDiagnostics.reportFailure(interaction, 'command-dispatcher', error);
+    if (interaction.commandName === 'setup') console.error(`[SETUP] Command gagal stage=${setupStage} guild=${interaction.guildId || 'none'} interaction=${interaction.id || 'unknown'} ${safeErrorDiagnostic(error)}`);
 
     // Jangan membuat crash jika Discord sudah menganggap
     // interaksi kedaluwarsa atau responsnya tidak bisa dikirim.
@@ -2207,9 +1992,9 @@ client.on('interactionCreate', async interaction => {
 
 
 // NIGHTMARE_TEMPVOICE
-const TEMPVOICE_TRIGGER = '➕・Create Voice';
+const TEMPVOICE_TRIGGER = '➕・create-voice';
 const TEMPVOICE_PREFIX = '🔊・';
-const tempVoiceRooms = new Set();
+const temporaryVoiceService = createTemporaryVoiceService({ logger: console });
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
   try {
@@ -2226,19 +2011,20 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     // Member masuk channel pemicu: buat room sementara.
     if (
       newState.channel &&
-      newState.channel.name.toLowerCase().replace(/-/g, ' ') === TEMPVOICE_TRIGGER.toLowerCase() &&
+      newState.channel.name === TEMPVOICE_TRIGGER &&
       oldState.channelId !== newState.channelId
     ) {
       const member = newState.member;
-      if (!member || !member.manageable) {
-        // Tetap coba membuat room; pemindahan mungkin gagal bila izin kurang.
+      if (!member) {
+        console.error('[TEMPVOICE] Member tidak tersedia pada event voice state.');
+        return;
       }
 
       const channels = await guild.channels.fetch();
       const tempCategory = channels.find(
         channel =>
           channel.type === ChannelType.GuildCategory &&
-          channel.name.toLowerCase().includes('voice lounge')
+          channel.name === '– – ~ 🔊 • | VOICE LOUNGE |'
       );
 
       if (!tempCategory) {
@@ -2246,41 +2032,23 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         return;
       }
 
-      const room = await guild.channels.create({
+      await temporaryVoiceService.createRoom({
+        guild,
+        member,
+        category: tempCategory,
         name: `${TEMPVOICE_PREFIX}${member.displayName}`.slice(0, 100),
-        type: ChannelType.GuildVoice,
-        parent: tempCategory.id,
-        reason: 'Temporary Voice Nightmare',
         permissionOverwrites: [
           {
             id: guild.roles.everyone.id,
-            allow: [
-              PermissionFlagsBits.ViewChannel,
-              PermissionFlagsBits.Connect
-            ]
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect]
           }
         ]
       });
-
-      tempVoiceRooms.add(room.id);
-
-      try {
-        await member.voice.setChannel(room);
-      } catch (moveError) {
-        console.error('Gagal memindahkan member ke room:', moveError.message);
-      }
     }
 
     // Hapus room buatan bot setelah kosong.
     const leftChannel = oldState.channel;
-    if (
-      leftChannel &&
-      tempVoiceRooms.has(leftChannel.id) &&
-      leftChannel.members.size === 0
-    ) {
-      tempVoiceRooms.delete(leftChannel.id);
-      await leftChannel.delete('Temporary Voice kosong');
-    }
+    if (leftChannel) await temporaryVoiceService.cleanupEmptyRoom(leftChannel);
   } catch (error) {
     console.error('Temporary Voice error:', error.message);
   }

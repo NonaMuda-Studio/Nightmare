@@ -18,6 +18,7 @@ const { RANKS } = require('../economy-catalog');
 const { MONSTERS } = require('../adventure-monsters');
 const { SKILLS } = require('../adventure-skills');
 const { TEMPLATE_KEYS } = require('../announcement-studio');
+const { buildSetupCommand } = require('../setup-command-schema');
 const { RADIO_STATIONS, createRadioStore, hasRadioAdminPermission } = require('../radio-system');
 const vm = require('node:vm');
 
@@ -835,7 +836,7 @@ test('slash command JSON schema builds globally without removing legacy commands
   const end = source.indexOf(marker, start);
   assert.ok(start >= 0 && end >= 0, 'global command array found');
   const snippet = source.slice(start, end + marker.length);
-  const context = { SlashCommandBuilder, PermissionFlagsBits, ChannelType, ITEMS: require('../economy-catalog').ITEMS, RANKS, MONSTERS, SKILLS, TEMPLATE_KEYS, RADIO_STATIONS };
+  const context = { SlashCommandBuilder, PermissionFlagsBits, ChannelType, buildSetupCommand, ITEMS: require('../economy-catalog').ITEMS, RANKS, MONSTERS, SKILLS, TEMPLATE_KEYS, RADIO_STATIONS };
   vm.createContext(context);
   vm.runInContext(snippet + '\nthis.result = commands;', context);
   context.commands = context.result;
@@ -855,6 +856,10 @@ test('slash command JSON schema builds globally without removing legacy commands
     assert.ok(names.includes(name), 'expected global /' + name);
   }
   assert.equal(new Set(names).size, names.length, 'no duplicate global command names');
+  const setupCommand = commands.find(command => command.name === 'setup');
+  assert.equal(setupCommand.default_member_permissions, String(PermissionFlagsBits.ManageChannels));
+  assert.deepEqual(setupCommand.options[0].choices.map(choice => choice.value), ['large','medium','small']);
+
   for (const command of commands) for (const subcommand of command.options.filter(option => option.options)) for (const option of subcommand.options) assert.ok((option.choices || []).length <= 25, `${command.name}/${subcommand.name} choice limit`);
   const economy = commands.find(command => command.name === 'economy');
   assert.equal(economy.options.find(option => option.name === 'buy').options.find(option => option.name === 'item').autocomplete, true);
