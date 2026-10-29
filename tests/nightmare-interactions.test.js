@@ -10,7 +10,7 @@ const { createEconomyStore } = require('../nightmare-services');
 function interaction(action, options = {}) {
   const replies = [];
   return {
-    replies, guildId: '12345678901234567', user: { id: '12345678901234568', bot: false },
+    replies, id: '12345678901234580', guildId: '12345678901234567', user: { id: '12345678901234568', bot: false },
     inGuild: () => true, memberPermissions: { has: bit => bit === require('discord.js').PermissionFlagsBits.ManageGuild },
     options: {
       getSubcommand: () => action,
@@ -18,7 +18,7 @@ function interaction(action, options = {}) {
       getInteger: name => name === 'amount' ? (options.amount ?? 25) : (options.minutes ?? 10),
       getString: name => name === 'prize' ? (options.prize ?? 'Book') : (options.item ?? 'Potion')
     },
-    async deferReply() { replies.push('defer'); },
+    async deferReply(options) { replies.push('defer'); this.deferOptions = options; },
     async editReply(payload) { replies.push(payload); return payload; },
     async reply(payload) { replies.push(payload); return payload; }
   };
@@ -82,6 +82,33 @@ test('Adventure Discord handler registers and crafts against Economy inventory; 
   assert.ok(choices.some(option => option.value === 'magic_wand'));
 });
 
+test('Adventure slash handler acknowledges hunt privately and rejects another user without consuming a turn', async t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'nightmare-adventure-hunt-handler-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const store=createEconomyStore(path.join(dir,'economy.json'));const guildId='12345678901234567',owner='12345678901234568';store.registerAdventure(guildId,owner,'Rin');
+  const hunt=interaction('hunt');await handleAdventure(hunt,store);assert.equal(hunt.replies[0],'defer');assert.equal(hunt.deferOptions.flags,64);assert.match(hunt.replies[1],/Sesi berlaku 5 menit/);const session=hunt.id;
+  const outsider=interaction('fight');outsider.user={id:'12345678901234569',bot:false};outsider.options.getString=name=>name==='session'?session:name==='action'?'attack':null;await handleAdventure(outsider,store);assert.match(outsider.replies[1],/milik petualang lain/);
+  const ownerExit=interaction('fight');ownerExit.id='12345678901234581';ownerExit.options.getString=name=>name==='session'?session:name==='action'?'run':null;await handleAdventure(ownerExit,store);assert.match(ownerExit.replies[1],/kabur/);assert.equal(store.balance(guildId,owner),0);
+});
+
+test('Adventure admin subcommands enforce Administrator at execution and audit authorized bypasses', async t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'nightmare-adventure-admin-handler-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const store=createEconomyStore(path.join(dir,'economy.json'));const guild='12345678901234567',target='12345678901234569';store.registerAdventure(guild,target,'Kai');
+  const denied=interaction('rank');denied.options.getSubcommandGroup=()=> 'admin';denied.options.getUser=()=>({id:target,bot:false});denied.options.getString=()=> 'S';denied.memberPermissions={has:()=>false};await handleAdventure(denied,store);assert.match(denied.replies[1],/Administrator/);assert.equal(store.adventureProfile(guild,target).rank,'F');
+  const allowed=interaction('rank');allowed.options.getSubcommandGroup=()=> 'admin';allowed.options.getUser=()=>({id:target,bot:false});allowed.options.getString=()=> 'S';allowed.memberPermissions={has:value=>value===require('discord.js').PermissionFlagsBits.Administrator};await handleAdventure(allowed,store);assert.match(allowed.replies[1],/override admin/);assert.equal(store.adventureProfile(guild,target).rank,'S');
+  const botTarget=interaction('rank');botTarget.options.getSubcommandGroup=()=> 'admin';botTarget.options.getUser=()=>({id:target,bot:true});botTarget.memberPermissions=allowed.memberPermissions;await handleAdventure(botTarget,store);assert.match(botTarget.replies[1],/pemain manusia/);
+});
+
+test('Adventure skill commands are ephemeral, cast only learned skills, and admin skill bypass is authorized and audited', async t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'nightmare-adventure-skill-handler-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const store=createEconomyStore(path.join(dir,'economy.json'));const guild='12345678901234567',user='12345678901234568';store.registerAdventure(guild,user,'Mira');store.setAdventureSkillPoints(guild,user,user,'set',5,'12345678901234581');
+  const skills=interaction('skills');skills.options.getString=name=>name==='skill'?'arcane_slash':null;await handleAdventure(skills,store);assert.equal(skills.replies[0],'defer');assert.match(skills.replies[1],/Arcane Slash/);
+  const learn=interaction('learn');learn.options.getString=name=>name==='skill'?'arcane_slash':null;await handleAdventure(learn,store);assert.match(learn.replies[1],/Dipelajari/);assert.equal(store.adventureProfile(guild,user).skillPoints,4);
+  const game=store.startHunt(guild,user,'12345678901234582',{random:()=>0});const cast=interaction('cast');cast.options.getString=name=>name==='session'?game.id:'arcane_slash';await handleAdventure(cast,store);assert.match(cast.replies[1],/Arcane Slash/);const escape=interaction('fight');escape.id='12345678901234584';escape.options.getString=name=>name==='session'?game.id:'run';await handleAdventure(escape,store);
+  const forbidden=interaction('skill');forbidden.options.getSubcommandGroup=()=> 'admin';forbidden.options.getUser=()=>({id:user,bot:false});forbidden.options.getString=name=>name==='skill'?'crescent_nova':null;forbidden.options.getInteger=()=>1;forbidden.memberPermissions={has:()=>false};await handleAdventure(forbidden,store);assert.match(forbidden.replies[1],/Administrator/);assert.equal(store.adventureProfile(guild,user).skills.crescent_nova,undefined);
+  const bypass=interaction('skill');bypass.id='12345678901234583';bypass.options.getSubcommandGroup=()=> 'admin';bypass.options.getUser=()=>({id:user,bot:false});bypass.options.getString=name=>name==='skill'?'arcane_slash':null;bypass.options.getInteger=()=>2;bypass.memberPermissions={has:value=>value===require('discord.js').PermissionFlagsBits.Administrator};await handleAdventure(bypass,store);assert.match(bypass.replies[1],/level 1 → 2/);assert.ok(store.adventureProfile(guild,user).skills.arcane_slash===2);assert.ok(JSON.parse(fs.readFileSync(path.join(dir,'economy.json'),'utf8')).guilds[guild].adminAudit.some(entry=>entry.action==='adventure_skill_override'));
+});
+
+test('Adventure enemy autocomplete contains only catalog encounters', async () => {
+  let choices;await handleEconomyAutocomplete({commandName:'adventure',options:{getSubcommand:()=> 'enemy',getSubcommandGroup:()=> 'admin',getFocused:()=>({name:'monster',value:'gob'})},respond:async value=>{choices=value;}});assert.deepEqual(choices.map(option=>option.value),['goblin']);
+});
+
 test('giveaway creation enforces Manage Server and rolls message back on persistence failure', async () => {
   const it = interaction('create', { prize: 'Book' });
   it.channelId = '12345678901234570';
@@ -99,14 +126,15 @@ test('giveaway creation enforces Manage Server and rolls message back on persist
 });
 
 test('giveaway button creates a private response and handles storage failures', async () => {
-  const it = { user: { id: '12345678901234568', bot: false }, message: { id: '12345678901234569' }, replied: false, deferred: false, async reply(payload) { this.replied = true; this.payload = payload; } };
+  const it = { user: { id: '12345678901234568', bot: false }, message: { id: '12345678901234569' }, replied: false, deferred: false, async deferReply(payload) { this.deferred = true; this.deferOptions = payload; }, async editReply(content) { this.payload = { content }; }, async reply(payload) { this.replied = true; this.payload = payload; } };
   await handleGiveawayButton(it, { enter: () => true });
   assert.match(it.payload.content, /berhasil ikut/);
-  assert.equal(it.payload.flags, 64);
+  assert.equal(it.deferOptions.flags, 64);
 
-  const failed = { ...it, replied: false, async reply(payload) { this.replied = true; this.payload = payload; } };
+  const failed = { ...it, replied: false, deferred: false, async deferReply(payload) { this.deferred = true; this.deferOptions = payload; }, async editReply(content) { this.payload = { content }; } };
   await handleGiveawayButton(failed, { enter() { throw new Error('corrupt store'); } });
   assert.match(failed.payload.content, /Tidak dapat mendaftarkan/);
+  assert.equal(failed.deferOptions.flags, 64);
 });
 
 test('ticket open button creates a private channel, persists it and prevents duplicate openings', async () => {
@@ -127,6 +155,12 @@ test('ticket open button creates a private channel, persists it and prevents dup
   const duplicate = { ...it, deferred: false, replied: false, async deferReply() { this.deferred = true; }, async editReply(message) { this.result = message; } };
   await handleTicketButton(duplicate, { ...store, create() { throw new Error('Kamu sudah memiliki tiket terbuka.'); } });
   assert.match(duplicate.result, /sudah memiliki tiket/);
+});
+
+test('ticket close button acknowledges before reading persistent ticket state', async () => {
+  const it = { customId:'nightmare_ticket:close',guildId:'12345678901234567',channelId:'12345678901234573',user:{id:'12345678901234568'},deferred:false,async deferReply(){this.deferred=true;},async editReply(message){this.result=message;} };
+  const store={getByChannel(){assert.equal(it.deferred,true);return null;}};
+  await handleTicketButton(it,store);assert.match(it.result,/Channel tiket tidak ditemukan/);
 });
 
 test('ticket close/reopen button enforces roles, updates access, control buttons, and transcript', async () => {
@@ -189,7 +223,7 @@ test('ticket rejects unauthorized reopen and rolls stored status back if Discord
     saveTranscript() {},
     setStatus(_guild, _channel, next) { transitions.push(next); status = next; return { userId: '12345678901234568', channelId: '12345678901234573', status }; }
   };
-  const base = { customId: 'nightmare_ticket:reopen', guildId: '12345678901234567', channelId: '12345678901234573', user: { id: '12345678901234574' }, member: { roles: { cache: { has: () => false } } }, memberPermissions: { has: () => false }, replied: false, deferred: false, async reply(payload) { this.result = payload.content; } };
+  const base = { customId: 'nightmare_ticket:reopen', guildId: '12345678901234567', channelId: '12345678901234573', user: { id: '12345678901234574' }, member: { roles: { cache: { has: () => false } } }, memberPermissions: { has: () => false }, replied: false, deferred: false, async deferReply() { this.deferred = true; }, async editReply(payload) { this.result = payload; }, async reply(payload) { this.result = payload.content; } };
   await handleTicketButton(base, store);
   assert.match(base.result, /Hanya staf/);
   assert.deepEqual(transitions, []);

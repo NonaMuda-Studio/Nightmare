@@ -14,6 +14,11 @@ const { createPlaylistStore } = require('../playlist-store');
 const { searchLyrics } = require('../lyrics');
 const { isPrivateAddress } = require('../bot-profile');
 const { SlashCommandBuilder, PermissionFlagsBits, ChannelType } = require('discord.js');
+const { RANKS } = require('../economy-catalog');
+const { MONSTERS } = require('../adventure-monsters');
+const { SKILLS } = require('../adventure-skills');
+const { TEMPLATE_KEYS } = require('../announcement-studio');
+const { RADIO_STATIONS, createRadioStore, hasRadioAdminPermission } = require('../radio-system');
 const vm = require('node:vm');
 
 test('query validation accepts only supported HTTPS YouTube and Spotify tracks', () => {
@@ -147,7 +152,7 @@ function fakeSpawn(_binary, args) {
   return child;
 }
 
-test('YTDLP_PATH override and Termux default are used for every extractor invocation', async () => {
+test('explicit yt-dlp path, YTDLP_PATH, and Termux default are prioritized for extractor invocations', async () => {
   const configuredPath = '/custom/yt-dlp/bin/yt-dlp';
   const configuredCalls = [];
   const configuredSpawn = (binary, args, options) => {
@@ -178,6 +183,17 @@ test('YTDLP_PATH override and Termux default are used for every extractor invoca
   await defaultManager.resolveTrack('default path test');
   assert.deepEqual(defaultCalls, [DEFAULT_YTDLP_PATH]);
   defaultManager.cleanup();
+
+  const explicitCalls = [];
+  const explicitManager = createMusicManager({
+    ytDlp: '/explicit/yt-dlp',
+    env: { YTDLP_PATH: configuredPath },
+    spawn: (binary, args, options) => { explicitCalls.push(binary); return fakeSpawn(binary, args, options); },
+    players: new Map()
+  });
+  await explicitManager.resolveTrack('explicit path test');
+  assert.deepEqual(explicitCalls, ['/explicit/yt-dlp']);
+  explicitManager.cleanup();
 });
 
 test('outdated yt-dlp is rejected before connecting voice after the reproduced YouTube 403', async () => {
@@ -427,6 +443,364 @@ test('playlist persistence, guild isolation, validation, rename and item removal
   } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 });
 
+test('radio preferences persist by guild and reject unknown stations or unsafe reconnect state', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nightmare-radio-'));
+  const file = path.join(temp, 'radio.json');
+  try {
+    const store = createRadioStore(file);
+    assert.equal(store.get('123').mode, 'music');
+    store.setStation('123', 'study-lofi');
+    store.setMode('123', 'radio', '456', true);
+    store.setMode('123', 'radio', '456', true, 'sleep-lofi');
+    assert.equal(store.get('123').stationId, 'sleep-lofi');
+    store.setMode('123', 'radio', '456', true, 'study-lofi');
+    store.setStation('789', 'jazz-lofi');
+    const restarted = createRadioStore(file);
+    assert.deepEqual(restarted.get('123'), store.get('123'));
+    assert.equal(restarted.get('789').stationId, 'jazz-lofi');
+    assert.throws(() => store.setStation('123', 'not-a-station'), /Stasiun tidak dikenal/);
+    assert.throws(() => store.setMode('321', 'radio', null, true), /tidak valid/);
+    store.setMode('123', 'off', null, false);
+    assert.equal(createRadioStore(file).get('123').autoReconnect, false);
+  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
+});
+
+test('music/radio transitions share one player, preserve current track and queue, and are idempotent', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nightmare-radio-engine-'));
+  const store = createRadioStore(path.join(temp, 'radio.json'));
+  store.setStation('12345678901234567', 'study-lofi');
+  const voice = makeVoiceMocks();
+  const sourceStreams = [];
+  const manager = createMusicManager({
+    voice, spawn: fakeSpawn, radioStore: store, radioRetryLimit: 0, players: new Map(),
+    isRadioSourceVerified: stationId => stationId === 'study-lofi',
+    radioSources: { 'study-lofi': async () => { const stream = new PassThrough(); sourceStreams.push(stream); return { stream }; } }
+  });
+  const guild = { id: '12345678901234567', voiceAdapterCreator: {} };
+  const channel = { id: '12345678901234569' };
+  const requester = { id: 'radio-user', username: 'RadioUser' };
+  try {
+    await manager.enqueue(guild, channel, 'radio interrupted track', requester);
+    const state = manager.players.get(guild.id);
+    state.queue.push({ kind: 'music', track: { title: 'Queued next' }, query: 'queued next' });
+    const originalPlayer = state.player;
+    const first = await manager.moveToRadio(guild, channel, 'study-lofi');
+    assert.equal(first.alreadyActive, false);
+    assert.equal(voice.joins, 1);
+    assert.equal(manager.players.get(guild.id).player, originalPlayer);
+    assert.equal(manager.getSnapshot(guild.id).mode, 'radio');
+    assert.deepEqual(manager.getSnapshot(guild.id).queue.map(entry => entry.track.title), ['Test song', 'Queued next']);
+    assert.throws(() => manager.pause(guild.id), /Gunakan \/radio move mode:music/);
+    assert.throws(() => manager.resume(guild.id), /Gunakan \/radio move mode:music/);
+    assert.throws(() => manager.skip(guild.id), /stream kontinu/);
+    assert.throws(() => manager.stop(guild.id), /\/radio move mode:music/);
+    assert.equal(manager.setVolume(guild.id, 80), 80);
+    const again = await manager.moveToRadio(guild, channel, 'study-lofi');
+    assert.equal(again.alreadyActive, true);
+    assert.equal(voice.joins, 1);
+    const back = await manager.moveToMusic(guild.id);
+    assert.equal(back.alreadyActive, false);
+    assert.equal(manager.players.get(guild.id).player, originalPlayer);
+    assert.equal(voice.joins, 1);
+    assert.equal(manager.getSnapshot(guild.id).mode, 'music');
+    assert.equal(store.get(guild.id).stationId, 'study-lofi');
+    assert.equal(store.get(guild.id).autoReconnect, false);
+    manager.disconnect(guild.id);
+    assert.equal(store.get(guild.id).mode, 'off');
+    assert.equal(store.get(guild.id).autoReconnect, false);
+  } finally {
+    manager.cleanup();
+    for (const stream of sourceStreams) stream.destroy();
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('a delayed radio source is cancelled by a newer move to Music Mode and cannot start late', async () => {
+  const voice = makeVoiceMocks();
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nightmare-radio-cancel-'));
+  const store = createRadioStore(path.join(temp, 'radio.json'));
+  store.setStation('12345678901234568', 'study-lofi');
+  let lateSourceDestroyed = false;
+  const manager = createMusicManager({
+    voice, radioStore: store, players: new Map(),
+    isRadioSourceVerified: stationId => stationId === 'study-lofi',
+    radioSources: { 'study-lofi': () => new Promise(resolve => setTimeout(() => resolve({ stream: new PassThrough(), destroy() { lateSourceDestroyed = true; } }), 40)) }
+  });
+  const guild = { id: '12345678901234568', voiceAdapterCreator: {} };
+  try {
+    const goingRadio = manager.moveToRadio(guild, { id: '12345678901234570' }, 'study-lofi').catch(() => null);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const goingMusic = manager.moveToMusic(guild.id);
+    await Promise.all([goingRadio, goingMusic]);
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.notEqual(manager.getSnapshot(guild.id).mode, 'radio');
+    assert.equal(manager.getSnapshot(guild.id).current, null);
+    assert.equal(lateSourceDestroyed, true);
+    assert.equal(store.get(guild.id).autoReconnect, false);
+  } finally {
+    manager.cleanup();
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('radio source status is explicit and startup restoration honors persisted intent and source readiness', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nightmare-radio-restore-gates-'));
+  const store = createRadioStore(path.join(temp, 'radio.json'));
+  const guild = { id: '12345678901234581', voiceAdapterCreator: {} };
+  const channel = { id: '12345678901234582' };
+  const voice = makeVoiceMocks();
+  const unavailable = createMusicManager({ voice, radioStore: store, players: new Map() });
+  try {
+    store.setStation(guild.id, 'study-lofi');
+    assert.equal(unavailable.getSnapshot(guild.id).sourceStatus, 'source_not_configured');
+    store.setMode(guild.id, 'radio', channel.id, true);
+    assert.deepEqual(await unavailable.restoreRadio(guild, channel), { restored: false, reason: 'source_not_configured' });
+    assert.equal(voice.joins, 0);
+    unavailable.disconnect(guild.id);
+    assert.equal(store.get(guild.id).mode, 'off');
+    assert.deepEqual(await unavailable.restoreRadio(guild, channel), { restored: false, reason: 'radio_not_requested' });
+    assert.equal(voice.joins, 0);
+  } finally {
+    unavailable.cleanup();
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('startup restoration uses configured adapter and the existing shared player/connection', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nightmare-radio-restore-success-'));
+  const store = createRadioStore(path.join(temp, 'radio.json'));
+  const voice = makeVoiceMocks();
+  const streams = [];
+  const manager = createMusicManager({
+    voice, radioStore: store, players: new Map(),
+    isRadioSourceVerified: stationId => stationId === 'study-lofi',
+    radioSources: { 'study-lofi': () => { const stream = new PassThrough(); streams.push(stream); return { stream }; } }
+  });
+  const guild = { id: '12345678901234583', voiceAdapterCreator: {} };
+  const channel = { id: '12345678901234584' };
+  try {
+    store.setMode(guild.id, 'radio', channel.id, true, 'study-lofi');
+    const restored = await manager.restoreRadio(guild, channel);
+    assert.deepEqual(restored, { restored: true, reason: 'restored' });
+    const state = manager.players.get(guild.id);
+    assert.equal(state.mode, 'radio');
+    assert.equal(voice.joins, 1);
+    assert.equal(state.connection.player, state.player);
+    assert.equal(manager.getSnapshot(guild.id).sourceStatus, 'playing');
+    assert.deepEqual(await manager.restoreRadio(guild, { id: '12345678901234585' }), { restored: false, reason: 'voice_channel_unavailable' });
+  } finally {
+    manager.disconnect(guild.id);
+    for (const stream of streams) stream.destroy();
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('radio station catalog does not expose unverified URLs as active sources', () => {
+  assert.deepEqual(RADIO_STATIONS.map(station => station.id), ['study-lofi', 'sleep-lofi', 'anime-lofi', 'jazz-lofi']);
+  assert.ok(RADIO_STATIONS.every(station => station.available === false && !Object.hasOwn(station, 'url')));
+});
+
+test('unconfigured radio stations cannot create a voice connection or player', async () => {
+  const voice = makeVoiceMocks();
+  const manager = createMusicManager({ voice, players: new Map() });
+  await assert.rejects(manager.moveToRadio({ id: '12345678901234579', voiceAdapterCreator: {} }, { id: '12345678901234580' }, 'study-lofi'), /belum tersedia atau belum diverifikasi/);
+  assert.equal(voice.joins, 0);
+  assert.equal(manager.players.size, 0);
+  assert.equal(manager.getSnapshot('12345678901234579').mode, 'music');
+});
+
+test('configured adapter without source verification cannot enter Radio Mode', async () => {
+  const voice = makeVoiceMocks();
+  const manager = createMusicManager({
+    voice, players: new Map(),
+    radioSources: { 'study-lofi': () => ({ stream: new PassThrough() }) }
+  });
+  try {
+    assert.equal(manager.getRadioSourceStatus('study-lofi'), 'source_not_verified');
+    await assert.rejects(
+      manager.moveToRadio({ id: '12345678901234585', voiceAdapterCreator: {} }, { id: '12345678901234586' }, 'study-lofi'),
+      /belum diverifikasi/
+    );
+    assert.equal(voice.joins, 0);
+    assert.equal(manager.players.size, 0);
+    assert.equal(manager.getRadioSourceStatus('study-lofi'), 'source_not_verified');
+  } finally { manager.cleanup(); }
+});
+
+test('radio transition permissions accept only Manage Server or Administrator', () => {
+  const flags = { Administrator: 8n, ManageGuild: 32n };
+  const permissions = bits => ({ has: value => (bits & value) === value });
+  assert.equal(hasRadioAdminPermission(permissions(32n), flags), true);
+  assert.equal(hasRadioAdminPermission(permissions(8n), flags), true);
+  assert.equal(hasRadioAdminPermission(permissions(1n), flags), false);
+  assert.equal(hasRadioAdminPermission(null, flags), false);
+});
+
+test('simultaneous radio transitions serialize to one active source and one voice connection', async () => {
+  const voice = makeVoiceMocks();
+  const sources = [];
+  const manager = createMusicManager({
+    voice, players: new Map(), radioRetryLimit: 0,
+    isRadioSourceVerified: stationId => stationId === 'study-lofi',
+    radioSources: { 'study-lofi': async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      const stream = new PassThrough();
+      sources.push(stream);
+      return { stream };
+    } }
+  });
+  const guild = { id: '12345678901234571', voiceAdapterCreator: {} };
+  const channel = { id: '12345678901234572' };
+  try {
+    const results = await Promise.all([
+      manager.moveToRadio(guild, channel, 'study-lofi'),
+      manager.moveToRadio(guild, channel, 'study-lofi')
+    ]);
+    assert.equal(results.filter(result => result.alreadyActive).length, 1);
+    assert.equal(voice.joins, 1);
+    assert.equal(manager.players.size, 1);
+    assert.equal(manager.getSnapshot(guild.id).mode, 'radio');
+    assert.equal(sources.length, 1);
+    await manager.moveToMusic(guild.id);
+  } finally {
+    manager.cleanup();
+    for (const stream of sources) stream.destroy();
+  }
+});
+
+test('radio source failures retain station choice and bounded retries stop cleanly', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nightmare-radio-retry-'));
+  const store = createRadioStore(path.join(temp, 'radio.json'));
+  store.setStation('12345678901234573', 'study-lofi');
+  let opens = 0;
+  const manager = createMusicManager({
+    voice: makeVoiceMocks(), radioStore: store, players: new Map(), radioRetryBaseDelayMs: 1, radioRetryLimit: 2,
+    isRadioSourceVerified: stationId => stationId === 'study-lofi',
+    radioSources: { 'study-lofi': async () => {
+      opens++;
+      if (opens > 1) throw new Error('mock source failure');
+      return { stream: new PassThrough() };
+    } }
+  });
+  const guild = { id: '12345678901234573', voiceAdapterCreator: {} };
+  try {
+    await manager.moveToRadio(guild, { id: '12345678901234574' }, 'study-lofi');
+    manager.players.get(guild.id).player.stop(true);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(opens, 3);
+    assert.equal(store.get(guild.id).stationId, 'study-lofi');
+    assert.equal(store.get(guild.id).mode, 'radio');
+    assert.equal(manager.getSnapshot(guild.id).radioRetryAttempts, 2);
+  } finally {
+    manager.cleanup();
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('recoverable voice disconnect reconnects radio once and preserves music queue intent', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nightmare-radio-voice-reconnect-'));
+  const store = createRadioStore(path.join(temp, 'radio.json'));
+  const voice = makeVoiceMocks();
+  voice.entersState = async (target, expected) => {
+    if (expected === voice.VoiceConnectionStatus.Signalling || expected === voice.VoiceConnectionStatus.Connecting) throw new Error('mock unrecoverable disconnect');
+    if (target.state) target.state.status = expected;
+    return target;
+  };
+  let sourceOpens = 0;
+  const manager = createMusicManager({
+    voice, radioStore: store, players: new Map(), radioVoiceReconnectBaseDelayMs: 1,
+    isRadioSourceVerified: stationId => stationId === 'study-lofi',
+    radioSources: { 'study-lofi': () => { sourceOpens++; return { stream: new PassThrough() }; } }
+  });
+  const guild = { id: '12345678901234575', voiceAdapterCreator: {} };
+  const channel = { id: '12345678901234576' };
+  store.setStation(guild.id, 'study-lofi');
+  try {
+    await manager.moveToRadio(guild, channel, 'study-lofi');
+    const oldState = manager.players.get(guild.id);
+    oldState.queue.push({ kind: 'music', track: { title: 'Preserved queue' }, query: 'preserved' });
+    oldState.connection.emit(voice.VoiceConnectionStatus.Disconnected);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(voice.joins, 2);
+    assert.equal(sourceOpens, 2);
+    assert.equal(manager.getSnapshot(guild.id).mode, 'radio');
+    assert.deepEqual(manager.getSnapshot(guild.id).queue.map(entry => entry.track.title), ['Preserved queue']);
+    assert.equal(store.get(guild.id).autoReconnect, true);
+  } finally {
+    manager.disconnect(guild.id);
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('/dc while radio reconnect is pending cancels the timer and leaves radio off', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nightmare-radio-dc-reconnect-'));
+  const store = createRadioStore(path.join(temp, 'radio.json'));
+  const voice = makeVoiceMocks();
+  voice.entersState = async (target, expected) => {
+    if (expected === voice.VoiceConnectionStatus.Signalling || expected === voice.VoiceConnectionStatus.Connecting) throw new Error('mock unrecoverable disconnect');
+    if (target.state) target.state.status = expected;
+    return target;
+  };
+  let sourceOpens = 0;
+  const manager = createMusicManager({
+    voice, radioStore: store, players: new Map(), radioVoiceReconnectBaseDelayMs: 2000,
+    isRadioSourceVerified: stationId => stationId === 'study-lofi',
+    radioSources: { 'study-lofi': () => { sourceOpens++; return { stream: new PassThrough() }; } }
+  });
+  const guild = { id: '12345678901234587', voiceAdapterCreator: {} };
+  const channel = { id: '12345678901234588' };
+  try {
+    store.setStation(guild.id, 'study-lofi');
+    await manager.moveToRadio(guild, channel, 'study-lofi');
+    assert.equal(manager.getSnapshot(guild.id).mode, 'radio');
+    manager.players.get(guild.id).connection.emit(voice.VoiceConnectionStatus.Disconnected);
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.equal(manager.players.has(guild.id), false, 'the failed voice session is removed before its reconnect timer');
+    assert.equal(store.get(guild.id).mode, 'radio');
+    assert.equal(manager.disconnect(guild.id), true, 'dc succeeds by cancelling the pending reconnect intent');
+    assert.equal(store.get(guild.id).mode, 'off');
+    assert.equal(store.get(guild.id).autoReconnect, false);
+    t.mock.timers.tick(10_000);
+    assert.equal(voice.joins, 1);
+    assert.equal(sourceOpens, 1);
+  } finally {
+    manager.cleanup();
+    t.mock.timers.reset();
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('saved radio intent survives engine reconstruction and can be restored with the same station', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nightmare-radio-restart-'));
+  const file = path.join(temp, 'radio.json');
+  const store = createRadioStore(file);
+  const guild = { id: '12345678901234577', voiceAdapterCreator: {} };
+  const channel = { id: '12345678901234578' };
+  const adapter = () => ({ stream: new PassThrough() });
+  const first = createMusicManager({ voice: makeVoiceMocks(), radioStore: store, players: new Map(), radioSources: { 'study-lofi': adapter }, isRadioSourceVerified: stationId => stationId === 'study-lofi' });
+  try {
+    store.setStation(guild.id, 'study-lofi');
+    await first.moveToRadio(guild, channel, 'study-lofi');
+    first.cleanup();
+    const reloadedStore = createRadioStore(file);
+    const second = createMusicManager({ voice: makeVoiceMocks(), radioStore: reloadedStore, players: new Map(), radioSources: { 'study-lofi': adapter }, isRadioSourceVerified: stationId => stationId === 'study-lofi' });
+    try {
+      const saved = reloadedStore.get(guild.id);
+      assert.equal(saved.mode, 'radio');
+      assert.equal(saved.stationId, 'study-lofi');
+      assert.equal(saved.voiceChannelId, channel.id);
+      assert.equal(saved.autoReconnect, true);
+      assert.deepEqual(await second.restoreRadio(guild, channel), { restored: true, reason: 'restored' });
+      assert.equal(second.getSnapshot(guild.id).mode, 'radio');
+      assert.equal(second.getSnapshot(guild.id).queue.length, 0, 'music queue remains memory-only');
+    } finally { second.disconnect(guild.id); }
+  } finally {
+    first.cleanup();
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test('lyrics search returns official result link without copying lyric text', async () => {
   let requested;
   const result = await searchLyrics('Song', 'Artist', {
@@ -461,7 +835,7 @@ test('slash command JSON schema builds globally without removing legacy commands
   const end = source.indexOf(marker, start);
   assert.ok(start >= 0 && end >= 0, 'global command array found');
   const snippet = source.slice(start, end + marker.length);
-  const context = { SlashCommandBuilder, PermissionFlagsBits, ChannelType, ITEMS: require('../economy-catalog').ITEMS };
+  const context = { SlashCommandBuilder, PermissionFlagsBits, ChannelType, ITEMS: require('../economy-catalog').ITEMS, RANKS, MONSTERS, SKILLS, TEMPLATE_KEYS, RADIO_STATIONS };
   vm.createContext(context);
   vm.runInContext(snippet + '\nthis.result = commands;', context);
   context.commands = context.result;
@@ -469,19 +843,45 @@ test('slash command JSON schema builds globally without removing legacy commands
   const adventureEnd = source.indexOf('\n  .toJSON());', adventureStart) + '\n  .toJSON());'.length;
   assert.ok(adventureStart >= 0 && adventureEnd > adventureStart, 'Adventure command builder found');
   vm.runInContext(source.slice(adventureStart, adventureEnd), context);
+  const announcementStart=source.indexOf("commands.push(new SlashCommandBuilder().setName('announcement')");
+  const announcementEnd=source.indexOf('\n\n// NIGHTMARE_REALTIME_SERVER_STATUS',announcementStart);
+  assert.ok(announcementStart>=0&&announcementEnd>announcementStart,'Announcement command builder found');
+  vm.runInContext(source.slice(announcementStart,announcementEnd),context);
   const commands = context.result;
   assert.match(source, /createPlaygroundService\(economyStore\)/, 'playground uses the existing economy store');
   assert.match(source, /handlePlaygroundCommand\(interaction, playgroundService\)/, 'playground slash command is dispatched');
   const names = commands.map(command => command.name);
-  for (const name of ['ping','setup','resetserver','resetpreview','bg','reactionrole','play','pause','resume','skip','stop','queue','nowplaying','volume','dc','playlist','lyrics','botprofile','rank','level','card','rewards','boosters','leaderboard','xpboost','level-config','level-rewards','give-xp','give-level','remove-xp','remove-level','xp','giveaway','economy','economy-admin','item','adventure','ticket','notify','playground']) {
+  for (const name of ['ping','setup','resetserver','resetpreview','bg','reactionrole','play','pause','resume','skip','stop','queue','nowplaying','volume','dc','radio','music','playlist','lyrics','botprofile','rank','level','card','rewards','boosters','leaderboard','xpboost','level-config','level-rewards','give-xp','give-level','remove-xp','remove-level','xp','giveaway','economy','economy-admin','item','adventure','announcement','ticket','notify','playground']) {
     assert.ok(names.includes(name), 'expected global /' + name);
   }
   assert.equal(new Set(names).size, names.length, 'no duplicate global command names');
   for (const command of commands) for (const subcommand of command.options.filter(option => option.options)) for (const option of subcommand.options) assert.ok((option.choices || []).length <= 25, `${command.name}/${subcommand.name} choice limit`);
   const economy = commands.find(command => command.name === 'economy');
   assert.equal(economy.options.find(option => option.name === 'buy').options.find(option => option.name === 'item').autocomplete, true);
+  const adventure = commands.find(command => command.name === 'adventure');
+  assert.deepEqual(adventure.options.map(option => option.name), ['register','profile','inventory','materials','recipes','craft','hunt','fight','quest','equip','unequip','use','open-box','skills','learn','upgrade','cast','admin']);
+  assert.deepEqual(adventure.options.find(option=>option.name==='admin').options.map(option=>option.name),['rank','stats','skillpoints','enemy','skill']);
+  assert.equal(adventure.options.find(option=>option.name==='cast').options.find(option=>option.name==='skill').choices.length,3);
+  assert.equal(adventure.options.find(option => option.name === 'fight').options.find(option => option.name === 'action').choices.length, 4);
+  const announcement=commands.find(command=>command.name==='announcement');assert.deepEqual(announcement.options[0].options.find(option=>option.name==='template').choices.map(choice=>choice.value),['update','info','event','announcement','maintenance']);
+  assert.equal(announcement.default_member_permissions,String(PermissionFlagsBits.ManageGuild));
+  assert.match(source,/interaction\.commandName === 'announcement'\) return await handleAnnouncementCreate/,'announcement slash command is dispatched');
+  assert.match(source,/handleAnnouncementComponent\(interaction, announcementDraftStore\)/,'announcement buttons are routed');
+  assert.match(source,/handleAnnouncementModal\(interaction, announcementDraftStore\)/,'announcement modals are routed');
+  assert.match(source,/Routes\.applicationCommands\(client\.application\.id\),\s*\{ body: commands \}/,'the generated command array is the Discord registration payload');
+  assert.match(source,/interactionDiagnostics\.instrument\(interaction, 'component-listener'\)/,'component/modal interactions are instrumented in the first listener');
+  assert.match(source,/interactionDiagnostics\.instrument\(interaction, 'command-dispatcher'\)/,'slash/autocomplete interactions are instrumented in the dispatcher');
+  assert.match(source,/diagnostic\.attempts === 0/,'autocomplete fallback only responds when no response was attempted');
+  assert.match(source,/errorResponseAction\(interaction, diagnostic, error\)/,'dispatcher fallback distinguishes successful defer from failed acknowledgment');
   const playlist = commands.find(command => command.name === 'playlist');
   assert.deepEqual(playlist.options.map(option => option.name), ['create','rename','list','add','remove','play']);
+  const radio = commands.find(command => command.name === 'radio');
+  assert.deepEqual(radio.options.map(option => option.name), ['move','station','status']);
+  assert.deepEqual(radio.options.find(option => option.name === 'move').options[0].choices.map(choice => choice.value), ['music']);
+  assert.deepEqual(radio.options.find(option => option.name === 'station').options[0].choices.map(choice => choice.value), RADIO_STATIONS.map(station => station.id));
+  assert.equal(commands.find(command => command.name === 'music').options[0].name, 'move');
+  assert.match(source, /interaction\.commandName === 'radio'\) return await handleRadioCommand/);
+  assert.match(source, /interaction\.commandName === 'music'\) return await handleMusicModeCommand/);
   const profile = commands.find(command => command.name === 'botprofile');
   assert.equal(profile.default_member_permissions, String(PermissionFlagsBits.Administrator));
   const reactionrole = commands.find(command => command.name === 'reactionrole');

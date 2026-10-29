@@ -57,7 +57,7 @@ The repository was re-audited before this stage. The existing data files remain 
 | 2 | Tickets | DONE | `/ticket` command and buttons persist close deadline, transcript, and deletion state. Five fake-timer tests pass for 60 seconds, reopen, restart recovery, retry/permission failure, and missing channels. |
 | 3 | Notifications | DONE | Existing `/notify` handler, per-server config, persistent outbox, duplicate suppression and retry tests remain connected. |
 | 4 | Playground & mini-games | DONE | `/playground` remains connected to the same `economyStore` as `/economy`; existing win/loss, fee, duplicate-action and concurrency tests pass. |
-| 5 | Economy | PARTIAL | Added 30 stable item IDs, catalog autocomplete, per-guild buy prices, `/economy sell`, item/admin commands, audit records, and a shared Economy crafting inventory. Atomic buy/sell/craft and handler tests pass. Mystery Box opening/odds, active potion use and complete Adventure progression remain unfinished, so the broad Economy/RPG scope is not marked DONE. |
+| 5 | Economy | PARTIAL | Shared Economy wallet/inventory powers shop, crafting, Adventure combat/loot/quest, equipment, consumables, Mystery Box, and audited Adventure admin overrides. RPG JSON mutations assume a single bot process per file. |
 | 6 | Leveling & XP | PARTIAL | Existing XP, voice XP, rank card, rewards and admin flow are preserved; regression tests pass. No full feature audit/config UI expansion was part of this stage. |
 | 7 | Radio | NOT IMPLEMENTED | No independent radio session or verified stream provider. |
 | 8 | Welcome & goodbye | PARTIAL | Existing member-card and `/bg` paths remain. Per-server message/channel templates still need implementation and audit. |
@@ -65,19 +65,20 @@ The repository was re-audited before this stage. The existing data files remain 
 | 10 | Music | PARTIAL | Existing music/provider/playlist system remains unchanged by this stage; music and queue regression tests pass. |
 | 11 | AI chat | NOT IMPLEMENTED | No provider-backed command; no credentials added. |
 | 12 | Server setup & management | PARTIAL | Existing setup, preview, reset confirmation and reaction roles preserved. Production destructive operations were not run. |
+| 13 | Announcement Studio | PARTIAL | `/announcement create` editor, private preview, explicit send confirmation, mentions allowlist, permission checks, expiry and one-send state are implemented and locally mocked; no live Discord delivery/registration test. |
 
 ### Economy and Adventure work in this stage
 
 `/economy` now exposes balance, daily, transfer, shop, buy, sell, inventory and leaderboard. `/economy-admin add|remove|reset|price` and `/item give|remove` require Discord Administrator permission. Reset requires an explicit `confirm: true`. Administrative changes write actor, target, action, before/after values and timestamp in the same economy JSON transaction. Catalog selection is autocomplete (not static choice lists), so all current entries remain reachable without violating Discord's 25-choice limit.
 
-`/adventure register|profile|inventory|materials|recipes|craft` is registered and dispatched. Registration/profile data lives inside the same guild record in `data/economy.json`; items and crafting inputs/outputs use the shared Economy inventory. Craft checks rank and all ingredients before consuming inputs, then writes ingredient consumption and output together. This is the first Adventure/crafting stage only: hunt/combat, quest, equipment effects, potion use, rank trials, and Mystery Box opening are still pending.
+`/adventure register|profile|inventory|materials|recipes|craft|hunt|fight|quest|equip|unequip|use|open-box` is registered and dispatched. Combat is turn-based with owner-bound, five-minute sessions, expiry, duplicate-action suppression, attack/defend/potion/escape, monster stats, losses, and victory-only rewards. Quest reward is claimable once daily after three hunt wins. Ranks F–S derive from EXP, hunt and quest thresholds. Equipment and potions consume/return the shared Economy inventory, and Mystery Box rewards are selected server-side from fixed catalog items. Monster Bait is consumed with a successful session start for guaranteed bonus loot on victory and is spent on escape/loss/expiry; failed session creation leaves it intact. Mana Potion is deliberately inactive because no mana system/effect exists. Existing version-1 Economy records are read in place. Adventure uses slash commands with ephemeral defer/edit replies; no Adventure buttons or production Discord tests exist.
 
 Catalog and recipe tables, actual command syntax, and known limits are in `NIGHTMARE_FEATURES.md`.
 
 ### Verification for this stage
 
 - Ticket deletion focused tests: 5 passed, 0 failed.
-- Economy/Adventure service, handler, and command schema tests: passed after resolving one test fixture mismatch (the audit assertion expected two records although price, balance, and item admin actions correctly wrote three).
+- Economy/Adventure tests include shared inventory, crafting, hunt settlement/expiry/replay, bait outcomes, quest claim dedupe, rank-gated equipment, potion validation, box overflow, private acknowledgment/owner rejection, and slash command schema preservation.
 - `node --check` over all project JavaScript files: passed.
 - Final `npm test`: 90 passed, 0 failed (the previous baseline was 84/84).
 - All tests use local fixtures and temporary files. No production Discord tests were performed.
@@ -85,3 +86,28 @@ Catalog and recipe tables, actual command syntax, and known limits are in `NIGHT
 ### Earlier six test failures: causes and corrections
 
 Three rank/card test failures had one harness cause: `tests/level-interaction.test.js` evaluates the handler in a VM but omitted production scope globals `performance` and `interactionDispatchStartedAt`; both are now supplied. The voice test called `tracker.clear` with one argument although the API requires `(guildId, userId)`; its fixture now passes both. The reset test threw generic `timeout`, unlike Discord.js collector expiration (`reason: time`); the mock now represents the actual collector reason. The economy service test's fake clock began only ten seconds after epoch, which correctly fell within the daily cooldown initialized at zero; it now models current time. These were test fixture issues, not production defects. The added interaction test initially also compared a Discord permission `BigInt` with a number and now uses the Discord.js constant.
+
+## Local implementation: Announcement Studio and Adventure admin (2026-10-29)
+
+- Added `/announcement create` with five templates, ephemeral editor/modal flows, image validation, channel/role scoping, explicit confirmation, bot/user permission checks, mention allowlisting, draft expiry and send deduplication. Draft state is process-local; send errors are marked uncertain to avoid duplicate retries.
+- Preserved `/notify` and its persistent join/leave outbox, retry, dedupe, cooldown, and mention rules without changes.
+- Added `/adventure admin rank|stats|skillpoints|enemy`. Rank overrides persist through normal progression. ATK/DEF/current/max HP update actual combat fields with validation; stat changes are blocked during active combat. Skill points now fund learned/upgraded skills and are audited when administered. Enemy selection is from the pre-existing Slime/Goblin/Dire Wolf encounter data and sets the next hunt.
+- Admin mutations check Administrator at runtime, require existing player profiles, deduplicate interaction IDs, and write actor/target/action/before/after to the Economy admin audit.
+- Local unit/handler/schema tests use mocks and temp JSON fixtures only. No Discord API command registration, announcement send, deployment, or production config/data change was performed.
+
+## Interaction acknowledgment stabilization (2026-10-29)
+
+- Component routing and command dispatch remain separate across the two existing listeners; one Discord event is not run through both handler families.
+- Moved acknowledgment ahead of synchronous giveaway/ticket store reads and announcement confirmation's channel/role REST fetches. Prevented autocomplete from retrying a rejected `respond()` and made dispatcher recovery distinguish confirmed defers from failed initial acknowledgments.
+- Added safe `[INTERACTION]` age/latency/failure diagnostics and regression tests for late, duplicate, and expired acknowledgments. Historical 10062 events cannot be attributed to one command from the supplied logs because they contain no interaction name or age; live test-server diagnostics are needed to distinguish gateway/event-loop delay from Discord REST failure.
+- Follow-up diagnosis: Discord.js `createdTimestamp` is derived from the interaction snowflake, while `Date.now()` records listener receipt time; the reported ~8-second age is therefore not handler execution time. Diagnostics now sample event-loop delay with `monitorEventLoopDelay` and report the maximum locally measured stall since the prior interaction, the handler time before initial acknowledgement, and age beyond that maximum (a comparison, not a causal decomposition). The supplied event log shows only 7.4 ms between local listeners, so it places the delay before listener delivery; it cannot distinguish gateway delivery delay from a local stall or host clock offset without the new event-loop measurement and clock verification.
+- Startup audit found that `clientReady` runs asynchronous REST registration, server status fetches, giveaway/notification recovery, and ticket recovery. There is no synchronous wait around the REST call; JSON stores do use synchronous file reads/writes, including XP writes scheduled from message events. No source evidence proves any of these caused the reported 8-second gap. No runtime registration or production data operation was performed.
+- Command builders are included in the existing full `Routes.applicationCommands(..., { body: commands })` registration payload. No registration request was sent in this audit; a restart using the existing ready-time registration path is needed to publish any local schema changes.
+
+## Local implementation: Adventure Skill System (2026-10-29)
+
+- Added `/adventure skills|learn|upgrade|cast` and `/adventure admin skill`, preserving existing subcommands and the shared Adventure/Economy profile/store.
+- Normal rank advancement grants one Skill Point per rank gained; admin rank overrides do not award progression points. Administrator can add/set points and set a catalog skill level with runtime permission checks and before/after audit entries.
+- Skill levels persist in the existing Economy JSON profile. Passive skills affect combat calculations, active skills consume a combat turn, and the rank B ultimate can be used once per hunt.
+- Service tests exercise actual combat outcomes as well as costs, prerequisites, persistence, authorization, owner/guild, expiry, duplicate actions and ultimate limits. Discord registration/live interaction is not verified; tests use local fixtures and mocks.
+- JSON persistence remains single-process per file and has no cross-process locking.

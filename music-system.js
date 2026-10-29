@@ -2,13 +2,14 @@
 
 const { spawn } = require('node:child_process');
 const { Transform, pipeline } = require('node:stream');
+const { RADIO_STATION_BY_ID } = require('./radio-system');
 const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
 const SPOTIFY_HOST = 'open.spotify.com';
 const MAX_QUERY_LENGTH = 200;
 const MAX_QUEUE_SIZE = 100;
 const YTDLP_FORMAT = 'bestaudio[acodec=opus][ext=webm]';
 const MIN_YTDLP_403_FIX = '2026.08.19';
-const DEFAULT_YTDLP_PATH = '/data/data/com.termux/files/home/yt-dlp-venv/bin/yt-dlp';
+const DEFAULT_YTDLP_PATH = '/data/data/com.termux/files/usr/bin/yt-dlp';
 
 function sanitizeExtractorError(value) {
   return String(value || '')
@@ -81,12 +82,36 @@ function createMusicManager(options = {}) {
   const prism = options.prism || require('prism-media');
   const environment = options.env || process.env;
   const ytDlp = options.ytDlp || environment.YTDLP_PATH || DEFAULT_YTDLP_PATH;
+  const radioSources = options.radioSources || {};
+  const isRadioSourceVerified = options.isRadioSourceVerified || (stationId => RADIO_STATION_BY_ID.get(stationId)?.available === true);
+  const radioStore = options.radioStore || null;
+  const radioRetryLimit = Number.isInteger(options.radioRetryLimit) ? Math.max(0, Math.min(10, options.radioRetryLimit)) : 5;
+  const radioRetryBaseDelayMs = Number.isInteger(options.radioRetryBaseDelayMs) ? Math.max(1, options.radioRetryBaseDelayMs) : 1000;
+  const radioVoiceReconnectLimit = Number.isInteger(options.radioVoiceReconnectLimit) ? Math.max(0, Math.min(10, options.radioVoiceReconnectLimit)) : 5;
+  const radioVoiceReconnectBaseDelayMs = Number.isInteger(options.radioVoiceReconnectBaseDelayMs) ? Math.max(1, options.radioVoiceReconnectBaseDelayMs) : 2000;
   const getYtDlpVersion = options.getYtDlpVersion || (async () => (await runYtDlp(['--version'], 256)).trim());
   const players = options.players || new Map();
   const connecting = new Map();
+  const transitions = new Map();
+  const pendingTransitions = new Set();
+  const reconnectTimers = new Map();
   let ytDlpVersionPromise;
 
   function stateFor(guildId) { return players.get(guildId); }
+
+  async function serializeTransition(guildId, task) {
+    const previous = transitions.get(guildId) || Promise.resolve();
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const chain = previous.catch(() => {}).then(() => gate);
+    transitions.set(guildId, chain);
+    await previous.catch(() => {});
+    try { return await task(); }
+    finally {
+      release();
+      if (transitions.get(guildId) === chain) transitions.delete(guildId);
+    }
+  }
 
   async function runYtDlp(args, maxBytes = 2_000_000) {
     return await new Promise((resolve, reject) => {
@@ -225,7 +250,12 @@ function createMusicManager(options = {}) {
       isStarting: false,
       starting: null,
       generation: 0,
-      destroyed: false
+      destroyed: false,
+      mode: 'music',
+      transitioning: false,
+      radioStationId: null,
+      radioRetryAttempts: 0,
+      radioRetryTimer: null
     };
     players.set(guild.id, created);
     // Count packets at the public methods used by AudioPlayer's transport path.
@@ -291,9 +321,12 @@ function createMusicManager(options = {}) {
       console.log(`[MUSIC] guild=${guild.id} audio-player-state=playing resource=${resource?.playStream?.constructor?.name || 'unknown'} inputType=${resource?.encoder ? 'prism-opus-encoder' : 'unknown'} subscription=${Boolean(created.connectionSubscription)} voice=${connection.state?.status || 'unknown'}; status ini bukan bukti audio terdengar`);
     });
     player.on(voice.AudioPlayerStatus.Idle, () => {
+      const ended = created.current;
       terminateCurrent(created);
       created.current = null;
-      void playNext(created);
+      if (!created.transitioning && created.mode === 'radio' && ended?.kind === 'radio') {
+        scheduleRadioRetry(created, ended.stationId);
+      } else if (!created.transitioning && created.mode === 'music') void playNext(created);
     });
     player.on('error', error => {
       if (created.current?.resource?.metadata?.diagnostics) created.current.resource.metadata.diagnostics.stopReason = 'player-error';
@@ -304,9 +337,11 @@ function createMusicManager(options = {}) {
       } catch (callbackError) {
         console.warn(`[MUSIC] guild=${guild.id} callback error gagal: ${sanitizeExtractorError(callbackError.message)}`);
       }
+      const errored = created.current;
       terminateCurrent(created);
       created.current = null;
-      void playNext(created);
+      if (!created.transitioning && created.mode === 'radio' && errored?.kind === 'radio') scheduleRadioRetry(created, errored.stationId);
+      else if (!created.transitioning && created.mode === 'music') void playNext(created);
     });
     connection.on('error', error => console.error(`[MUSIC] guild=${guild.id} tahap=voice error=${sanitizeExtractorError(error.message)}`));
     connection.on(voice.VoiceConnectionStatus.Disconnected, async () => {
@@ -316,7 +351,12 @@ function createMusicManager(options = {}) {
           voice.entersState(connection, voice.VoiceConnectionStatus.Connecting, 5000)
         ]);
       } catch {
-        if (players.get(guild.id) === created) destroyState(created);
+        if (players.get(guild.id) === created) {
+          const shouldRecover = created.mode === 'radio' && radioStore?.get(guild.id)?.autoReconnect;
+          const preservedQueue = shouldRecover ? created.queue.slice() : [];
+          destroyState(created);
+          if (shouldRecover) scheduleVoiceReconnect(guild, voiceChannel, created.radioStationId, 1, preservedQueue);
+        }
       }
     });
     try {
@@ -348,13 +388,17 @@ function createMusicManager(options = {}) {
 
   function terminateCurrent(state) {
     if (state.current?.process && !state.current.process.killed) state.current.process.kill('SIGTERM');
+    try { state.current?.abortController?.abort(); } catch {}
+    try { state.current?.cleanup?.(); } catch (error) { console.warn(`[MUSIC] guild=${state.guildId} radio cleanup gagal: ${sanitizeExtractorError(error.message)}`); }
     state.current?.resource?.playStream?.destroy?.();
   }
 
   function destroyState(state) {
     if (!state || state.destroyed) return;
+    state.radioOpeningAbort?.abort();
     if (state.current?.resource?.metadata?.diagnostics) state.current.resource.metadata.diagnostics.stopReason = 'disconnect';
     state.destroyed = true;
+    clearTimeout(state.radioRetryTimer);
     try { options.onVoiceMonitorEnd?.(state.guildId, state.voiceChannelId); }
     catch (error) { console.warn(`[MUSIC] guild=${state.guildId} voice-monitor cleanup gagal: ${error.message}`); }
     terminateCurrent(state);
@@ -367,7 +411,7 @@ function createMusicManager(options = {}) {
   }
 
   async function playNext(state) {
-    if (state.destroyed || state.isStarting || state.current || !state.queue.length) return;
+    if (state.destroyed || state.transitioning || state.mode !== 'music' || state.isStarting || state.current || !state.queue.length) return;
     state.isStarting = true;
     while (!state.destroyed && !state.current && state.queue.length) {
       const entry = state.queue.shift();
@@ -489,12 +533,253 @@ function createMusicManager(options = {}) {
     state.isStarting = false;
   }
 
+  function getRadioAdapter(stationId) {
+    const adapter = radioSources instanceof Map ? radioSources.get(stationId) : radioSources[stationId];
+    if (!adapter || (typeof adapter !== 'function' && typeof adapter.open !== 'function')) {
+      throw new Error('Sumber radio untuk stasiun ini belum tersedia atau belum diverifikasi. Pilihan stasiun tetap dapat disimpan.');
+    }
+    return adapter;
+  }
+
+  // Adapter contract: open({ guildId, voiceChannelId, signal }) returns
+  // { stream: Readable<Buffer>, destroy? }. `stream` must be raw signed 16-bit
+  // little-endian PCM, 48 kHz, stereo. The shared engine applies volume and
+  // encodes Opus; adapters must not create AudioPlayers or voice connections.
+  function getRadioSourceStatus(stationId, state = null) {
+    if (!stationId) return 'station_not_selected';
+    const adapter = radioSources instanceof Map ? radioSources.get(stationId) : radioSources[stationId];
+    if (!adapter || (typeof adapter !== 'function' && typeof adapter.open !== 'function')) return 'source_not_configured';
+    const station = RADIO_STATION_BY_ID.get(stationId);
+    if (!station || !isRadioSourceVerified(stationId)) return 'source_not_verified';
+    if (state?.current?.kind === 'radio' && state.current.stationId === stationId) {
+      return state.player.state.status === voice.AudioPlayerStatus.Playing ? 'playing' : 'source_starting';
+    }
+    return 'source_configured';
+  }
+
+  async function openRadioSource(state, stationId, generation) {
+    const adapter = getRadioAdapter(stationId);
+    const abortController = new AbortController();
+    state.radioOpeningAbort = abortController;
+    const context = { guildId: state.guildId, voiceChannelId: state.voiceChannelId, signal: abortController.signal };
+    let source;
+    try {
+      const opening = Promise.resolve().then(() => typeof adapter === 'function' ? adapter(context) : adapter.open(context));
+      const cancelToken = Symbol('radio-source-cancelled');
+      const cancelled = new Promise(resolve => abortController.signal.addEventListener('abort', () => resolve(cancelToken), { once: true }));
+      source = await Promise.race([opening, cancelled]);
+      if (source === cancelToken) {
+        if (state.radioOpeningAbort === abortController) state.radioOpeningAbort = null;
+        opening.then(lateSource => {
+          try { lateSource?.destroy?.(); } catch {}
+          try { lateSource?.stream?.destroy?.(); } catch {}
+        }).catch(() => {});
+        return false;
+      }
+      if (!source || !source.stream || typeof source.stream.pipe !== 'function') throw new Error('Adapter radio harus menghasilkan PCM Readable stream.');
+      if (state.destroyed || state.generation !== generation || state.mode !== 'radio') {
+        abortController.abort();
+        if (state.radioOpeningAbort === abortController) state.radioOpeningAbort = null;
+        source.destroy?.();
+        source.stream.destroy?.();
+        return false;
+      }
+      const volume = createPcmVolumeTransformer(() => state.volume);
+      const encoder = new prism.opus.Encoder({ frameSize: 960, channels: 2, rate: 48000 });
+      const resource = voice.createAudioResource(encoder, {
+        inputType: voice.StreamType.Opus,
+        metadata: { kind: 'radio', stationId }
+      });
+      const entry = {
+        kind: 'radio', stationId, resource, abortController,
+        cleanup: source.destroy ? () => source.destroy() : null,
+        source
+      };
+      state.radioOpeningAbort = null;
+      state.current = entry;
+      pipeline(source.stream, volume, encoder, error => {
+        if (error && state.current === entry && !abortController.signal.aborted) {
+          console.warn(`[MUSIC] guild=${state.guildId} radio stream gagal: ${sanitizeExtractorError(error.message)}`);
+          try { state.player.stop(true); } catch {}
+        }
+      });
+      state.player.play(resource);
+      state.radioRetryAttempts = 0;
+      return true;
+    } catch (error) {
+      if (state.radioOpeningAbort === abortController) state.radioOpeningAbort = null;
+      abortController.abort();
+      try { source?.destroy?.(); } catch {}
+      try { source?.stream?.destroy?.(); } catch {}
+      throw error;
+    }
+  }
+
+  function scheduleRadioRetry(state, stationId) {
+    if (state.destroyed || state.mode !== 'radio' || state.transitioning || state.radioRetryTimer) return;
+    if (state.radioRetryAttempts >= radioRetryLimit) {
+      console.error(`[MUSIC] guild=${state.guildId} radio retry berhenti setelah batas ${radioRetryLimit} percobaan; konfigurasi dipertahankan.`);
+      return;
+    }
+    const attempt = ++state.radioRetryAttempts;
+    const generation = state.generation;
+    const delay = Math.min(30_000, radioRetryBaseDelayMs * (2 ** (attempt - 1)));
+    state.radioRetryTimer = setTimeout(async () => {
+      state.radioRetryTimer = null;
+      if (state.destroyed || state.mode !== 'radio' || state.generation !== generation || state.current) return;
+      try {
+        await openRadioSource(state, stationId, generation);
+      } catch (error) {
+        console.warn(`[MUSIC] guild=${state.guildId} radio retry=${attempt} gagal: ${sanitizeExtractorError(error.message)}`);
+        scheduleRadioRetry(state, stationId);
+      }
+    }, delay);
+    state.radioRetryTimer.unref?.();
+  }
+
+  function scheduleVoiceReconnect(guild, voiceChannel, stationId, attempt, preservedQueue = []) {
+    const guildId = String(guild.id);
+    if (reconnectTimers.has(guildId) || attempt > radioVoiceReconnectLimit) return;
+    const delay = Math.min(60_000, radioVoiceReconnectBaseDelayMs * (2 ** (attempt - 1)));
+    const timer = setTimeout(async () => {
+      reconnectTimers.delete(guildId);
+      const config = radioStore?.get(guildId);
+      if (!config?.autoReconnect || config.mode !== 'radio' || config.stationId !== stationId) return;
+      try {
+        await moveToRadio(guild, voiceChannel, stationId);
+        const state = stateFor(guildId);
+        if (state && preservedQueue.length) state.queue.unshift(...preservedQueue.filter(entry => !state.queue.includes(entry)));
+      }
+      catch (error) {
+        console.warn(`[MUSIC] guild=${guildId} voice reconnect=${attempt} gagal: ${sanitizeExtractorError(error.message)}`);
+        scheduleVoiceReconnect(guild, voiceChannel, stationId, attempt + 1, preservedQueue);
+      }
+    }, delay);
+    timer.unref?.();
+    reconnectTimers.set(guildId, timer);
+  }
+
+  async function moveToRadio(guild, voiceChannel, stationId) {
+    const guildId = String(guild?.id || '');
+    if (!/^\d{1,22}$/.test(guildId) || !voiceChannel?.id) throw new Error('Guild dan voice channel valid diperlukan untuk memulai radio.');
+    getRadioAdapter(stationId);
+    if (!RADIO_STATION_BY_ID.has(stationId) || !isRadioSourceVerified(stationId)) {
+      throw new Error('Sumber radio untuk stasiun ini belum diverifikasi; pilihan stasiun tetap dapat disimpan.');
+    }
+    const persistedBefore = radioStore?.get(guildId);
+    return serializeTransition(guildId, async () => {
+      const reconnectTimer = reconnectTimers.get(guildId);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimers.delete(guildId);
+      let state = stateFor(guildId);
+      if (state?.mode === 'radio' && state.radioStationId === stationId && !state.transitioning) return { alreadyActive: true, state };
+      pendingTransitions.add(guildId);
+      if (state && state.voiceChannelId !== voiceChannel.id) {
+        pendingTransitions.delete(guildId);
+        throw new Error('Bot sudah berada di voice channel lain di server ini.');
+      }
+      if (state) {
+        state.transitioning = true;
+        state.generation++;
+        clearTimeout(state.radioRetryTimer);
+        state.radioRetryTimer = null;
+        const interrupted = state.current?.kind === 'music' ? state.current : state.starting;
+        if (interrupted && !state.queue.includes(interrupted)) state.queue.unshift(interrupted);
+        if (state.current) {
+          if (state.current.resource?.metadata?.diagnostics) state.current.resource.metadata.diagnostics.stopReason = 'mode-switch';
+          terminateCurrent(state);
+          state.current = null;
+        }
+        state.starting = null;
+        state.isStarting = false;
+        state.player.stop(true);
+      }
+      try {
+        state = await connect(guild, voiceChannel);
+        state.transitioning = true;
+        state.mode = 'radio';
+        state.radioStationId = stationId;
+        state.generation++;
+        const generation = state.generation;
+        if (radioStore) radioStore.setMode(guildId, 'radio', voiceChannel.id, true, stationId);
+        const started = await openRadioSource(state, stationId, generation);
+        if (!started) throw new Error('Permintaan radio sudah digantikan oleh transisi yang lebih baru.');
+        state.transitioning = false;
+        pendingTransitions.delete(guildId);
+        return { alreadyActive: false, state };
+      } catch (error) {
+        pendingTransitions.delete(guildId);
+        if (state && !state.destroyed) {
+          state.generation++;
+          state.mode = 'music';
+          state.radioStationId = null;
+          state.transitioning = false;
+          if (radioStore) {
+            if (persistedBefore?.mode === 'radio' && persistedBefore.autoReconnect && persistedBefore.stationId === stationId) {
+              radioStore.setMode(guildId, 'radio', persistedBefore.voiceChannelId || state.voiceChannelId, true, persistedBefore.stationId);
+            } else radioStore.setMode(guildId, 'music', state.voiceChannelId, false, persistedBefore?.stationId ?? stationId);
+          }
+          void playNext(state);
+        }
+        throw error;
+      }
+    });
+  }
+
+  async function moveToMusic(guildId) {
+    const id = String(guildId);
+    const switching = stateFor(id);
+    if (switching?.transitioning) {
+      switching.generation++;
+      switching.radioOpeningAbort?.abort();
+    }
+    return serializeTransition(id, async () => {
+      const state = stateFor(id);
+      if (!state || (state.mode === 'music' && !state.transitioning)) {
+        radioStore?.setMode(id, 'music', state?.voiceChannelId || null, false);
+        return { alreadyActive: true, state: state || null };
+      }
+      radioStore?.setMode(id, 'music', state.voiceChannelId, false);
+      state.transitioning = true;
+      state.generation++;
+      clearTimeout(state.radioRetryTimer);
+      state.radioRetryTimer = null;
+      if (state.current) {
+        terminateCurrent(state);
+        state.current = null;
+      }
+      state.player.stop(true);
+      state.mode = 'music';
+      state.radioStationId = null;
+      state.transitioning = false;
+      if (state.queue.length) void playNext(state);
+      return { alreadyActive: false, state };
+    });
+  }
+
+  async function restoreRadio(guild, voiceChannel) {
+    const guildId = String(guild?.id || '');
+    const config = radioStore?.get(guildId);
+    if (!config || config.mode !== 'radio' || !config.autoReconnect || !config.stationId || !config.voiceChannelId) {
+      return { restored: false, reason: 'radio_not_requested' };
+    }
+    const sourceStatus = getRadioSourceStatus(config.stationId);
+    if (sourceStatus !== 'source_configured') return { restored: false, reason: sourceStatus };
+    if (!voiceChannel?.id || String(voiceChannel.id) !== config.voiceChannelId) {
+      return { restored: false, reason: 'voice_channel_unavailable' };
+    }
+    await moveToRadio(guild, voiceChannel, config.stationId);
+    return { restored: true, reason: 'restored' };
+  }
+
   async function enqueue(guild, voiceChannel, query, requester, callbacks = {}) {
+    if (pendingTransitions.has(String(guild.id))) throw new Error('Mode musik sedang berpindah; coba lagi sebentar.');
     const track = await resolveTrack(query);
     await assertCompatibleAudioExtractor();
     const state = await connect(guild, voiceChannel);
+    if (state.mode === 'radio' || state.transitioning) throw new Error('Radio Mode aktif atau sedang berpindah. Jalankan /radio move mode:music terlebih dahulu.');
     if (state.queue.length >= MAX_QUEUE_SIZE) throw new Error('Antrean server penuh (maksimal 100 lagu menunggu).');
-    const entry = { track, query: track.query, requester: requester.tag || requester.username || requester.id, requesterId: requester.id, onError: callbacks.onError };
+    const entry = { kind: 'music', track, query: track.query, requester: requester.tag || requester.username || requester.id, requesterId: requester.id, onError: callbacks.onError };
     const position = state.queue.length + (state.current || state.isStarting ? 2 : 1);
     state.queue.push(entry);
     if (!state.current && !state.isStarting) void playNext(state);
@@ -505,6 +790,7 @@ function createMusicManager(options = {}) {
     const parsedSavedUrl = saved.url ? parseSupportedUrl(saved.url) : null;
     if (saved.url && parsedSavedUrl?.type !== 'youtube') throw new Error('URL tersimpan pada playlist bukan URL YouTube yang valid.');
     return {
+      kind: 'music',
       track: parsedSavedUrl ? {
         query: saved.query,
         title: saved.title,
@@ -523,8 +809,10 @@ function createMusicManager(options = {}) {
   async function enqueueSavedMany(guild, voiceChannel, savedItems, requester) {
     if (!Array.isArray(savedItems) || !savedItems.length) throw new Error('Tidak ada lagu untuk dimasukkan ke antrean.');
     const entries = savedItems.map(saved => makeSavedEntry(saved, requester));
+    if (pendingTransitions.has(String(guild.id))) throw new Error('Mode musik sedang berpindah; coba lagi sebentar.');
     await assertCompatibleAudioExtractor();
     const state = await connect(guild, voiceChannel);
+    if (state.mode === 'radio' || state.transitioning) throw new Error('Radio Mode aktif atau sedang berpindah. Jalankan /radio move mode:music terlebih dahulu.');
     if (state.queue.length + entries.length > MAX_QUEUE_SIZE) throw new Error('Antrean server penuh; maksimal ada 100 lagu menunggu.');
     state.queue.push(...entries);
     if (!state.current && !state.isStarting) void playNext(state);
@@ -537,16 +825,19 @@ function createMusicManager(options = {}) {
 
   function pause(guildId) {
     const state = stateFor(guildId);
+    if (state?.mode === 'radio') throw new Error('Radio sedang aktif. Gunakan /radio move mode:music sebelum mengontrol lagu.');
     if (!state?.current) throw new Error('Tidak ada lagu yang sedang diputar.');
     if (!state.player.pause()) throw new Error('Player tidak dapat dijeda pada status saat ini.');
   }
   function resume(guildId) {
     const state = stateFor(guildId);
+    if (state?.mode === 'radio') throw new Error('Radio sedang aktif. Gunakan /radio move mode:music sebelum mengontrol lagu.');
     if (!state?.current) throw new Error('Tidak ada lagu yang dapat dilanjutkan.');
     if (!state.player.unpause()) throw new Error('Player tidak sedang dijeda.');
   }
   function skip(guildId) {
     const state = stateFor(guildId);
+    if (state?.mode === 'radio') throw new Error('Radio adalah stream kontinu dan tidak dapat di-skip.');
     if (!state?.current) throw new Error(state?.starting ? 'Lagu masih disiapkan; coba skip lagi setelah pemutaran mulai.' : 'Tidak ada lagu yang sedang diputar.');
     if (state.current?.resource?.metadata?.diagnostics) state.current.resource.metadata.diagnostics.stopReason = 'skip';
     state.player.stop(true);
@@ -554,6 +845,7 @@ function createMusicManager(options = {}) {
   function stop(guildId) {
     const state = stateFor(guildId);
     if (!state) return false;
+    if (state.mode === 'radio') throw new Error('Radio sedang aktif. Gunakan /radio move mode:music atau /dc.');
     state.queue.length = 0;
     state.generation++;
     state.isStarting = false;
@@ -565,9 +857,23 @@ function createMusicManager(options = {}) {
     return true;
   }
   function disconnect(guildId) {
-    const state = stateFor(guildId);
-    if (!state) return false;
+    const id = String(guildId);
+    const state = stateFor(id);
+    let persistenceError = null;
+    try { radioStore?.setMode(id, 'off', null, false); }
+    catch (error) { persistenceError = error; }
+    pendingTransitions.delete(id);
+    const reconnectTimer = reconnectTimers.get(id);
+    const cancelledReconnect = Boolean(reconnectTimer);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimers.delete(id);
+    if (!state) {
+      if (persistenceError) throw new Error('Tidak terhubung, dan niat auto-reconnect gagal disimpan: ' + persistenceError.message);
+      return cancelledReconnect;
+    }
+    state.generation++;
     destroyState(state);
+    if (persistenceError) throw new Error('Voice diputuskan, tetapi niat auto-reconnect gagal disimpan: ' + persistenceError.message);
     return true;
   }
   function setVolume(guildId, percent) {
@@ -579,18 +885,24 @@ function createMusicManager(options = {}) {
   }
   function getSnapshot(guildId) {
     const state = stateFor(guildId);
-    if (!state) return { current: null, queue: [], volume: null, voiceChannelId: null, paused: false };
+    if (!state) return { current: null, queue: [], volume: null, voiceChannelId: null, paused: false, mode: 'music', radioStationId: null, sourceStatus: getRadioSourceStatus(radioStore?.get(String(guildId))?.stationId), connectionStatus: 'disconnected', playerStatus: 'idle', radioRetryAttempts: 0 };
     return {
       current: state.current || state.starting,
       queue: [...state.queue],
       volume: state.volume,
       voiceChannelId: state.voiceChannelId,
-      paused: state.player.state.status === voice.AudioPlayerStatus.Paused
+      paused: state.player.state.status === voice.AudioPlayerStatus.Paused,
+      mode: state.mode,
+      radioStationId: state.radioStationId,
+      sourceStatus: getRadioSourceStatus(state.radioStationId || radioStore?.get(String(guildId))?.stationId, state),
+      connectionStatus: state.connection.state?.status || 'unknown',
+      playerStatus: state.player.state?.status || 'unknown',
+      radioRetryAttempts: state.radioRetryAttempts
     };
   }
   function cleanup() { for (const state of players.values()) destroyState(state); }
 
-  return { players, resolveTrack, enqueue, enqueueSaved, enqueueSavedMany, pause, resume, skip, stop, disconnect, setVolume, getSnapshot, cleanup };
+  return { players, resolveTrack, enqueue, enqueueSaved, enqueueSavedMany, pause, resume, skip, stop, disconnect, setVolume, getSnapshot, getRadioSourceStatus, restoreRadio, moveToRadio, moveToMusic, cleanup };
 }
 
 module.exports = { createMusicManager, parseSupportedUrl, formatDuration, isYouTubeWebpage, createPcmVolumeTransformer, MAX_QUERY_LENGTH, MAX_QUEUE_SIZE, MIN_YTDLP_403_FIX, DEFAULT_YTDLP_PATH };

@@ -4,7 +4,11 @@ const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFl
 const { saveAndPostTicketTranscript } = require('./ticket-deletion');
 const { ITEMS, getItem } = require('./economy-catalog');
 const { RECIPES } = require('./adventure-recipes');
+const { MONSTERS } = require('./adventure-monsters');
+const { SKILLS, getSkill } = require('./adventure-skills');
+const { handleAnnouncementCreate, handleAnnouncementComponent, handleAnnouncementModal } = require('./announcement-studio');
 const SHOP = Object.freeze(Object.fromEntries(ITEMS.map(item => [item.id, item.price])));
+function safeInteractionError(error) { const code = Number.isInteger(error?.code) ? error.code : 'none'; const type = /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(error?.name || '') ? error.name : 'Error'; return `type=${type} code=${code}`; }
 
 async function handleEconomy(interaction, store) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -55,6 +59,10 @@ async function handleEconomyAutocomplete(interaction) {
   const focused = interaction.options.getFocused(true);
   const query = String(focused.value || '').toLowerCase();
   const action = interaction.options.getSubcommand();
+  const group = interaction.options.getSubcommandGroup?.(false);
+  if (interaction.commandName === 'adventure' && group === 'admin' && action === 'enemy') {
+    return interaction.respond(MONSTERS.filter(monster => `${monster.name} ${monster.id}`.toLowerCase().includes(query)).slice(0, 25).map(monster => ({ name: `${monster.name} · HP ${monster.hp} · ATK ${monster.attack} · DEF ${monster.defense}`, value: monster.id })));
+  }
   const sellOnly = interaction.commandName === 'economy' && action === 'sell';
   const catalog = interaction.commandName === 'adventure' && action === 'craft' ? ITEMS.filter(item => Object.hasOwn(RECIPES, item.id)) : ITEMS;
   const choices = catalog.filter(item => (!sellOnly || item.sellPrice > 0) && (`${item.name} ${item.id}`.toLowerCase().includes(query)))
@@ -67,12 +75,42 @@ async function handleAdventure(interaction, store) {
   try {
     if (!interaction.inGuild?.() || !interaction.guildId) throw new Error('Adventure hanya dapat digunakan di server.');
     const action = interaction.options.getSubcommand(); const userId = interaction.user.id; let response;
+    if (interaction.options.getSubcommandGroup?.(false) === 'admin') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) throw new Error('Perlu izin Administrator untuk bypass Adventure.');
+      const target = interaction.options.getUser('target', true);
+      if (!target || target.bot) throw new Error('Target harus pemain manusia yang memiliki profil Adventure.');
+      if (action === 'rank') {
+        const result = store.setAdventureRank(interaction.guildId, userId, target.id, interaction.options.getString('rank', true), interaction.id);
+        response = result.duplicate ? 'ℹ️ Perubahan admin ini sudah diproses.' : `✅ Rank <@${target.id}> ditetapkan ke **${result.rank}** melalui override admin; progression normal tidak akan menimpanya.`;
+      } else if (action === 'stats') {
+        const result = store.setAdventureStats(interaction.guildId, userId, target.id, { attack: interaction.options.getInteger('attack', true), defense: interaction.options.getInteger('defense', true), maxHp: interaction.options.getInteger('max_hp', true), currentHp: interaction.options.getInteger('current_hp', true) }, interaction.id);
+        response = result.duplicate ? 'ℹ️ Perubahan admin ini sudah diproses.' : `✅ Stat <@${target.id}> diperbarui: ATK ${result.attack}, DEF ${result.defense}, HP ${result.currentHp}/${result.maxHp}. Equipment tetap dihitung sebagai bonus terpisah.`;
+      } else if (action === 'skillpoints') {
+        const result = store.setAdventureSkillPoints(interaction.guildId, userId, target.id, interaction.options.getString('operation', true), interaction.options.getInteger('amount', true), interaction.id);
+        response = result.duplicate ? 'ℹ️ Perubahan admin ini sudah diproses.' : `✅ Skill point <@${target.id}>: ${result.before} → ${result.skillPoints}.`;
+      } else if (action === 'skill') {
+        const result = store.setAdventureSkill(interaction.guildId, userId, target.id, interaction.options.getString('skill', true), interaction.options.getInteger('level', true), interaction.id);
+        response = result.duplicate ? 'ℹ️ Perubahan admin ini sudah diproses.' : `✅ Skill **${result.skill.name}** milik <@${target.id}>: level ${result.before} → ${result.level}.`;
+      } else if (action === 'enemy') {
+        const result = store.setAdventureEnemy(interaction.guildId, userId, target.id, interaction.options.getString('monster', true), interaction.id);
+        response = result.duplicate ? 'ℹ️ Perubahan admin ini sudah diproses.' : `✅ Hunt berikutnya milik <@${target.id}> menggunakan **${result.monster.name}** dari katalog. Target harus memulai /adventure hunt.`;
+      } else throw new Error('Subcommand admin Adventure tidak dikenal.');
+      return await interaction.editReply(response);
+    }
     if (action === 'register') {
       const result = store.registerAdventure(interaction.guildId, userId, interaction.options.getString('name', true));
       response = result.created ? `🛡️ **${result.profile.name}** terdaftar di Guild sebagai petualang Rank F.` : `Kamu sudah terdaftar sebagai **${result.profile.name}** (Rank ${result.profile.rank}).`;
     } else if (action === 'profile') {
       const p = store.adventureProfile(interaction.guildId, userId); if (!p) throw new Error('Daftar dahulu dengan /adventure register.');
-      response = `🧙 **${p.name}** · Rank **${p.rank}**\nEXP ${p.exp} · HP ${p.hp}/${p.maxHp}\nAttack ${p.baseAttack} · Defense ${p.baseDefense}\nCoins ${p.balance} · perburuan ${p.hunts} · quest selesai ${p.completedQuests}`;
+      response = `🧙 **${p.name}** · Rank **${p.rank}**${p.rankOverride ? ' (override admin)' : ''}\nEXP ${p.exp} · HP ${p.hp}/${p.effectiveMaxHp}\nAttack ${p.combatAttack ?? p.baseAttack} · Defense ${p.combatDefense ?? p.baseDefense} · Mitigation ${(p.bonuses?.mitigation || 0) + (p.skillBonuses?.mitigation || 0)}\nEquipment: ${Object.values(p.equipment || {}).filter(Boolean).map(id => getItem(id)?.name || id).join(', ') || 'kosong'}\nSkill Point ${p.skillPoints || 0} · Skill: ${Object.entries(p.skills || {}).filter(([,level])=>level>0).map(([id,level])=>`${getSkill(id)?.name || id} Lv.${level}`).join(', ') || 'belum ada'}\nCoins ${p.balance} · perburuan ${p.hunts} · quest selesai ${p.completedQuests}`;
+    } else if (action === 'skills') {
+      const all = store.listAdventureSkills(interaction.guildId, userId), selected = interaction.options.getString('skill');
+      const visible = selected ? all.filter(skill => skill.id === selected) : all;
+      if (!visible.length) throw new Error('Skill tidak tersedia.');
+      response = `✨ **Skill Adventure**\n${visible.map(skill => `• **${skill.name}** [${skill.type}] Lv.${skill.level}/${skill.maxLevel} · biaya belajar ${skill.cost} SP/level dasar · Rank ${skill.rank}${skill.requires ? ` · prasyarat ${skill.requires}` : ''}${skill.unlocked ? '' : ' · terkunci'}${skill.level ? ' · dimiliki' : ''}\n  ${skill.description}`).join('\n')}\nSP tersedia: ${all[0]?.skillPoints || 0}. Gunakan /adventure learn dan /adventure upgrade.`;
+    } else if (action === 'learn' || action === 'upgrade') {
+      const skillId = interaction.options.getString('skill', true), result = action === 'learn' ? store.learnAdventureSkill(interaction.guildId, userId, skillId, interaction.id) : store.upgradeAdventureSkill(interaction.guildId, userId, skillId, interaction.id);
+      response = result.duplicate ? 'ℹ️ Interaksi skill ini sudah diproses.' : `✨ ${action === 'learn' ? 'Dipelajari' : 'Ditingkatkan'}: **${result.skill.name} Lv.${result.level}**. Biaya ${result.cost} SP; sisa ${result.skillPoints} SP.`;
     } else if (action === 'inventory' || action === 'materials') {
       const p = store.adventureProfile(interaction.guildId, userId); if (!p) throw new Error('Daftar dahulu dengan /adventure register.');
       const all = Object.entries(p.inventory).filter(([id]) => action !== 'materials' || getItem(id)?.category === 'material');
@@ -82,6 +120,24 @@ async function handleAdventure(interaction, store) {
     } else if (action === 'craft') {
       const quantity = interaction.options.getInteger('amount') || 1; const result = store.craft(interaction.guildId, userId, interaction.options.getString('item', true), quantity);
       response = `🔨 Craft berhasil: **${result.crafted} ${result.item.name}**. Sisa inventory: ${result.quantity}.`;
+    } else if (action === 'hunt') {
+      const game = store.startHunt(interaction.guildId, userId, interaction.id); response = `🐺 **${game.monster.name}** muncul! HP ${game.monster.hp}/${game.monster.maxHp} · serangan ${game.monster.attack}. Gunakan /adventure fight session:${game.id} action:attack (atau defend/potion/run). Sesi berlaku 5 menit.`;
+    } else if (action === 'fight') {
+      const result = store.actHunt(interaction.guildId, userId, interaction.options.getString('session', true), interaction.id, interaction.options.getString('action', true), interaction.options.getString('item'));
+      if (result.reason !== 'ok') throw new Error(({missing:'Sesi tidak ditemukan.',owner:'Sesi ini milik petualang lain.',duplicate:'Aksi sudah diproses.',ended:'Sesi sudah berakhir.',expired:'Sesi kedaluwarsa.'})[result.reason] || 'Aksi tidak dapat diproses.');
+      response = `${result.message}${!result.done ? `\nHP kamu ${result.game.playerHp}/${store.adventureProfile(interaction.guildId,userId).maxHp} · ${result.game.monster.name} ${result.game.monster.hp}/${result.game.monster.maxHp} HP. Sesi: ${result.game.id}` : ''}`;
+    } else if (action === 'cast') {
+      const skillId = interaction.options.getString('skill', true), result = store.actHunt(interaction.guildId, userId, interaction.options.getString('session', true), interaction.id, 'skill', skillId);
+      if (result.reason !== 'ok') throw new Error(({missing:'Sesi tidak ditemukan.',owner:'Sesi ini milik petualang lain.',duplicate:'Aksi sudah diproses.',ended:'Sesi sudah berakhir.',expired:'Sesi kedaluwarsa.'})[result.reason] || 'Skill tidak dapat digunakan.');
+      response = `${result.message}${!result.done ? `\nHP kamu ${result.game.playerHp}/${result.game.playerMaxHp} · ${result.game.monster.name} ${result.game.monster.hp}/${result.game.monster.maxHp} HP. Sesi: ${result.game.id}` : ''}`;
+    } else if (action === 'quest') {
+      const result = store.quest(interaction.guildId,userId); response = result.claimed ? `📜 Quest selesai: +${result.exp} EXP, ${result.coins} koin, 2 Herb.${result.skillPoints ? ` +${result.skillPoints} Skill Point dari progression rank.` : ''}${result.rankUp ? ` Rank naik ke ${result.rank}.` : ''}` : result.alreadyClaimed ? `📜 Hadiah quest hari ini sudah diklaim. Progress berikutnya: ${result.progress}/${result.target} kemenangan hunting.` : `📜 Quest harian: ${result.progress}/${result.target} hunting menang. Klaim tersedia setelah 3 kemenangan; hadiah 50 EXP, 75 koin, 2 Herb.`;
+    } else if (action === 'equip' || action === 'unequip') {
+      const result = store.equip(interaction.guildId,userId,interaction.options.getString('item'),interaction.options.getString('slot',true),action==='unequip'); response = action==='unequip' ? `✅ ${result.item.name} dilepas dan dikembalikan ke inventory.` : `✅ ${result.item.name} dipasang pada slot ${result.slot}.`;
+    } else if (action === 'use') {
+      const result = store.usePotion(interaction.guildId,userId,interaction.options.getString('item',true)); response = `🧪 ${result.item.name}: HP ${result.before} → ${result.hp}/${result.maxHp}.`;
+    } else if (action === 'open-box') {
+      const result = store.openMysteryBox(interaction.guildId,userId); response = `🎁 Mystery Box berisi **${result.quantity} ${result.item.name}**.`;
     } else throw new Error('Subcommand Adventure tidak dikenal.');
     return interaction.editReply(response);
   } catch (error) {
@@ -155,9 +211,12 @@ async function handleGiveawayCreate(interaction, store, { now = Date.now } = {})
 }
 
 async function handleGiveawayEntry(interaction, store) {
-  if (interaction.user?.bot) return interaction.reply({ content: 'Bot tidak dapat ikut giveaway.', flags: MessageFlags.Ephemeral });
-  const entered = store.enter(interaction.message.id, interaction.user.id);
-  return interaction.reply({ content: entered ? '🎉 Kamu berhasil ikut giveaway!' : 'Kamu sudah ikut atau giveaway ini sudah berakhir.', flags: MessageFlags.Ephemeral });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (interaction.user?.bot) return interaction.editReply('Bot tidak dapat ikut giveaway.');
+  let entered;
+  try { entered = store.enter(interaction.message.id, interaction.user.id); }
+  catch (error) { console.error(`[GIVEAWAY] Entry store gagal ${safeInteractionError(error)}`); return interaction.editReply('❌ Tidak dapat mendaftarkan entry. Coba lagi.'); }
+  return interaction.editReply(entered ? '🎉 Kamu berhasil ikut giveaway!' : 'Kamu sudah ikut atau giveaway ini sudah berakhir.');
 }
 
 async function finishDueGiveaways(client, store) {
@@ -176,7 +235,7 @@ async function finishDueGiveaways(client, store) {
 
 async function handleGiveawayButton(interaction, store) {
   try { return await handleGiveawayEntry(interaction, store); }
-  catch (error) { console.error(`[GIVEAWAY] Entry gagal ${interaction.message?.id}: ${error.message}`); if (!interaction.replied && !interaction.deferred) return interaction.reply({ content: '❌ Tidak dapat mendaftarkan entry. Coba lagi.', flags: MessageFlags.Ephemeral }); }
+  catch (error) { console.error(`[GIVEAWAY] Entry gagal ${interaction.message?.id}: ${safeInteractionError(error)}`); }
 }
 
 function ticketButtons(closed = false) {
@@ -245,10 +304,14 @@ async function setTicketStatus(interaction, store, action, lifecycle = {}) {
 }
 
 async function handleTicketButton(interaction, store, lifecycle = {}) {
+  let acknowledged = false;
+  let editAttempted = false;
   try {
     const [, action] = interaction.customId.split(':');
+    // Acknowledge before potentially growing JSON reads and Discord lookups.
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    acknowledged = true;
     if (action === 'open') {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const guild = interaction.guild;
       const config = store.configuration(guild.id);
       if (!config) throw new Error('Tiket belum dikonfigurasi administrator.');
@@ -268,15 +331,15 @@ async function handleTicketButton(interaction, store, lifecycle = {}) {
         try { await channel.delete('Rollback failed ticket creation'); } catch (cleanupError) { console.error(`[TICKET] Rollback channel ${channel.id} gagal: ${cleanupError.message}`); }
         throw error;
       }
+      editAttempted = true;
       return interaction.editReply(`✅ Tiket dibuat: <#${channel.id}>`);
     }
     const ticket = store.getByChannel(interaction.guildId, interaction.channelId);
-    if (!ticket) return interaction.reply({ content: 'Channel tiket tidak ditemukan.', flags: MessageFlags.Ephemeral });
+    if (!ticket) throw new Error('Channel tiket tidak ditemukan.');
     const config = store.configuration(interaction.guildId);
     const isStaff = Boolean(config?.staffRoleId && interaction.member?.roles?.cache?.has(config.staffRoleId));
     if (action === 'close' && interaction.user.id !== ticket.userId && !isStaff && !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) throw new Error('Hanya pembuat tiket atau staf yang dapat menutupnya.');
     if (action === 'reopen' && !isStaff && !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) throw new Error('Hanya staf tiket yang dapat membukanya kembali.');
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const wasOpen = ticket.status === 'open';
     const updated = store.setStatus(interaction.guildId, interaction.channelId, action === 'close' ? 'closed' : 'open');
     try { await interaction.channel.permissionOverwrites.edit(ticket.userId, { SendMessages: updated.status === 'open' }, `Ticket ${updated.status} by ${interaction.user.id}`); }
@@ -293,11 +356,12 @@ async function handleTicketButton(interaction, store, lifecycle = {}) {
       lifecycle.onReopened?.(interaction.guildId, interaction.channelId);
     }
     await interaction.message.edit({ components: ticketButtons(updated.status === 'closed') });
+    editAttempted = true;
     return interaction.editReply(`✅ Tiket ${updated.status === 'closed' ? 'ditutup' : 'dibuka kembali'}.`);
   } catch (error) {
-    console.warn(`[TICKET] Button ${interaction.customId} gagal: ${error.message}`);
-    if (interaction.deferred || interaction.replied) return interaction.editReply(`❌ ${error.message}`);
-    return interaction.reply({ content: `❌ ${error.message}`, flags: MessageFlags.Ephemeral });
+    console.warn(`[TICKET] Button ${interaction.customId} gagal: ${safeInteractionError(error)}`);
+    if ([10062, 40060].includes(error?.code)) return;
+    if (acknowledged && !editAttempted) { editAttempted = true; return interaction.editReply(`❌ ${error.message}`); }
   }
 }
 

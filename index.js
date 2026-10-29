@@ -31,14 +31,23 @@ const { renderRankCardSafely } = require('./rank-card');
 const { grantMilestoneRoles } = require('./level-rewards');
 const { buildLevelRolePanel, buildLevelRoleList, buildProgressBar } = require('./leveling-ui');
 const { resetGuildAfterConfirmation, activeResetMessages } = require('./level-admin');
+const { createResetConfirmationGuard } = require('./reset-confirmation');
 const { createVoiceXpTracker } = require('./voice-xp');
 const { createEconomyStore, createGiveawayStore, createTicketStore } = require('./nightmare-services');
 const { handleEconomy, handleEconomyAdmin, handleItemAdmin, handleAdventure, handleEconomyAutocomplete, handleGiveawayCreate, handleGiveawayButton, finishDueGiveaways, handleTicketCommand, handleTicketButton } = require('./nightmare-interactions');
 const { createNotificationStore, handleNotifyCommand, handleMemberNotification, retryPendingNotifications } = require('./notification-system');
 const { createPlaygroundService, handlePlaygroundCommand } = require('./playground-system');
 const { createTicketDeletionScheduler } = require('./ticket-deletion');
+const { RANKS } = require('./economy-catalog');
+const { MONSTERS } = require('./adventure-monsters');
+const { SKILLS } = require('./adventure-skills');
+const { TEMPLATE_KEYS, createAnnouncementDraftStore, handleAnnouncementCreate, handleAnnouncementComponent, handleAnnouncementModal } = require('./announcement-studio');
+const { createInteractionDiagnostics, errorResponseAction } = require('./interaction-diagnostics');
+const { RADIO_STATIONS, RADIO_STATION_BY_ID, createRadioStore, hasRadioAdminPermission } = require('./radio-system');
 let voiceXpTracker;
+const radioStore = createRadioStore(path.join(__dirname, 'data', 'radio.json'));
 const musicManager = createMusicManager({
+  radioStore,
   onVoiceActivity: (guildId, userId, channelId) => {
     const member = client.guilds.cache.get(guildId)?.members.cache.get(userId);
     if (!member || member.user.bot || member.voice.channelId !== channelId) return;
@@ -53,6 +62,7 @@ const giveawayStore = createGiveawayStore(path.join(__dirname, 'data', 'giveaway
 const ticketStore = createTicketStore(path.join(__dirname, 'data', 'tickets.json'));
 const notificationStore = createNotificationStore(path.join(__dirname, 'data', 'notifications.json'));
 const playgroundService = createPlaygroundService(economyStore);
+const announcementDraftStore = createAnnouncementDraftStore();
 voiceXpTracker = createVoiceXpTracker({
   award: async (guildId, userId) => {
     const result = xpStore.awardVoice(guildId, userId);
@@ -101,7 +111,9 @@ const client = new Client({
 });
 const ticketDeletionScheduler = createTicketDeletionScheduler({ store: ticketStore, client });
 const interactionDispatchStartedAt = new WeakMap();
+const interactionDiagnostics = createInteractionDiagnostics();
 const activeLeaderboardMessages = new Set();
+const resetConfirmationGuard = createResetConfirmationGuard();
 
 const template = [
   {
@@ -382,6 +394,19 @@ const commands = [
   new SlashCommandBuilder().setName('dc').setDescription('Putuskan koneksi musik dari voice channel'),
 
   new SlashCommandBuilder()
+    .setName('radio')
+    .setDescription('Kelola mode radio Lofi server')
+    .addSubcommand(sub => sub.setName('move').setDescription('Pindah dari Radio Mode ke Music Mode').addStringOption(opt => opt.setName('mode').setDescription('Mode tujuan').addChoices({ name: 'Music Mode', value: 'music' }).setRequired(true)))
+    .addSubcommand(sub => sub.setName('station').setDescription('Simpan stasiun radio terakhir').addStringOption(opt => opt.setName('name').setDescription('Stasiun radio (sumber belum aktif)')
+      .addChoices(...RADIO_STATIONS.map(station => ({ name: `${station.name} (belum tersedia)`, value: station.id }))).setRequired(true)))
+    .addSubcommand(sub => sub.setName('status').setDescription('Lihat mode dan status radio')),
+
+  new SlashCommandBuilder()
+    .setName('music')
+    .setDescription('Kelola mode Music server')
+    .addSubcommand(sub => sub.setName('move').setDescription('Pindah dari Music Mode ke Radio Mode').addStringOption(opt => opt.setName('mode').setDescription('Mode tujuan').addChoices({ name: 'Radio Mode', value: 'radio' }).setRequired(true))),
+
+  new SlashCommandBuilder()
     .setName('playlist')
     .setDescription('Kelola playlist bersama server')
     .addSubcommand(sub => sub.setName('create').setDescription('Buat playlist server').addStringOption(opt => opt.setName('name').setDescription('Nama playlist (2–40 karakter)').setMaxLength(40).setRequired(true)))
@@ -511,7 +536,21 @@ commands.push(new SlashCommandBuilder().setName('adventure').setDescription('Pet
   .addSubcommand(sub => sub.setName('materials').setDescription('Lihat material crafting'))
   .addSubcommand(sub => sub.setName('recipes').setDescription('Lihat resep crafting'))
   .addSubcommand(sub => sub.setName('craft').setDescription('Buat item dengan material').addStringOption(opt => opt.setName('item').setDescription('Item resep').setAutocomplete(true).setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah 1–100').setMinValue(1).setMaxValue(100).setRequired(false)))
+  .addSubcommand(sub => sub.setName('hunt').setDescription('Mulai sesi berburu turn-based'))
+  .addSubcommand(sub => sub.setName('fight').setDescription('Ambil aksi pada sesi hunting').addStringOption(opt => opt.setName('session').setDescription('ID sesi dari /adventure hunt').setRequired(true)).addStringOption(opt => opt.setName('action').setDescription('Aksi turn ini').addChoices({name:'Serang',value:'attack'},{name:'Bertahan',value:'defend'},{name:'Gunakan potion',value:'potion'},{name:'Kabur',value:'run'}).setRequired(true)).addStringOption(opt => opt.setName('item').setDescription('Potion yang digunakan').setAutocomplete(true).setRequired(false)))
+  .addSubcommand(sub => sub.setName('quest').setDescription('Lihat atau klaim quest guild harian'))
+  .addSubcommand(sub => sub.setName('equip').setDescription('Pasang equipment yang dimiliki').addStringOption(opt => opt.setName('slot').setDescription('Slot equipment').addChoices({name:'Weapon',value:'weapon'},{name:'Armor',value:'armor'},{name:'Accessory',value:'accessory'}).setRequired(true)).addStringOption(opt => opt.setName('item').setDescription('Item equipment').setAutocomplete(true).setRequired(true)))
+  .addSubcommand(sub => sub.setName('unequip').setDescription('Lepas equipment').addStringOption(opt => opt.setName('slot').setDescription('Slot equipment').addChoices({name:'Weapon',value:'weapon'},{name:'Armor',value:'armor'},{name:'Accessory',value:'accessory'}).setRequired(true)))
+  .addSubcommand(sub => sub.setName('use').setDescription('Gunakan potion pemulihan').addStringOption(opt => opt.setName('item').setDescription('Potion milikmu').setAutocomplete(true).setRequired(true)))
+  .addSubcommand(sub => sub.setName('open-box').setDescription('Buka satu Mystery Box milikmu'))
+  .addSubcommand(sub => sub.setName('skills').setDescription('Lihat daftar, efek, biaya, dan status skill').addStringOption(opt => opt.setName('skill').setDescription('Detail skill tertentu').addChoices(...SKILLS.map(skill=>({name:skill.name,value:skill.id}))).setRequired(false)))
+  .addSubcommand(sub => sub.setName('learn').setDescription('Pelajari skill menggunakan Skill Point').addStringOption(opt => opt.setName('skill').setDescription('Skill yang akan dipelajari').addChoices(...SKILLS.map(skill=>({name:skill.name,value:skill.id}))).setRequired(true)))
+  .addSubcommand(sub => sub.setName('upgrade').setDescription('Tingkatkan skill yang sudah dipelajari').addStringOption(opt => opt.setName('skill').setDescription('Skill yang akan ditingkatkan').addChoices(...SKILLS.map(skill=>({name:skill.name,value:skill.id}))).setRequired(true)))
+  .addSubcommand(sub => sub.setName('cast').setDescription('Gunakan skill aktif pada giliran pertarungan').addStringOption(opt => opt.setName('session').setDescription('ID sesi hunt aktif milikmu').setRequired(true)).addStringOption(opt => opt.setName('skill').setDescription('Skill aktif yang dipelajari').addChoices(...SKILLS.filter(skill=>skill.type!=='passive').map(skill=>({name:skill.name,value:skill.id}))).setRequired(true)))
+  .addSubcommandGroup(group => group.setName('admin').setDescription('Bypass Adventure untuk administrator').addSubcommand(sub => sub.setName('rank').setDescription('Tetapkan rank manual (melewati syarat normal)').addUserOption(opt => opt.setName('target').setDescription('Pemain terdaftar').setRequired(true)).addStringOption(opt => opt.setName('rank').setDescription('Rank F sampai S').addChoices(...RANKS.map(rank=>({name:rank,value:rank}))).setRequired(true))).addSubcommand(sub => sub.setName('stats').setDescription('Tetapkan ATK, DEF, max HP, dan HP saat ini').addUserOption(opt => opt.setName('target').setDescription('Pemain terdaftar').setRequired(true)).addIntegerOption(opt => opt.setName('attack').setDescription('ATK dasar (0–100.000)').setMinValue(0).setMaxValue(100000).setRequired(true)).addIntegerOption(opt => opt.setName('defense').setDescription('DEF dasar (0–100.000)').setMinValue(0).setMaxValue(100000).setRequired(true)).addIntegerOption(opt => opt.setName('max_hp').setDescription('HP maksimum (1–100.000)').setMinValue(1).setMaxValue(100000).setRequired(true)).addIntegerOption(opt => opt.setName('current_hp').setDescription('HP saat ini (0–100.000)').setMinValue(0).setMaxValue(100000).setRequired(true))).addSubcommand(sub => sub.setName('skillpoints').setDescription('Tambah atau tetapkan saldo skill point').addUserOption(opt => opt.setName('target').setDescription('Pemain terdaftar').setRequired(true)).addStringOption(opt => opt.setName('operation').setDescription('Operasi saldo').addChoices({name:'Tambah',value:'add'},{name:'Tetapkan',value:'set'}).setRequired(true)).addIntegerOption(opt => opt.setName('amount').setDescription('Jumlah (0–1.000.000)').setMinValue(0).setMaxValue(1000000).setRequired(true))).addSubcommand(sub => sub.setName('enemy').setDescription('Pilih musuh untuk hunt berikutnya pemain').addUserOption(opt => opt.setName('target').setDescription('Pemain terdaftar').setRequired(true)).addStringOption(opt => opt.setName('monster').setDescription('Musuh dari katalog Adventure').setAutocomplete(true).setRequired(true))).addSubcommand(sub => sub.setName('skill').setDescription('Tetapkan level skill tanpa biaya (0 menutup skill)').addUserOption(opt => opt.setName('target').setDescription('Pemain terdaftar').setRequired(true)).addStringOption(opt => opt.setName('skill').setDescription('Skill katalog').addChoices(...SKILLS.map(skill=>({name:skill.name,value:skill.id}))).setRequired(true)).addIntegerOption(opt => opt.setName('level').setDescription('Level skill').setMinValue(0).setMaxValue(3).setRequired(true))))
   .toJSON());
+
+commands.push(new SlashCommandBuilder().setName('announcement').setDescription('Buat pengumuman server dengan editor privat').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).addSubcommand(sub=>sub.setName('create').setDescription('Buat draft dari template').addStringOption(opt=>opt.setName('template').setDescription('Template pengumuman').addChoices(...TEMPLATE_KEYS.map(key=>({name:key,value:key}))).setRequired(true)).addChannelOption(opt=>opt.setName('channel').setDescription('Channel teks tujuan').addChannelTypes(ChannelType.GuildText,ChannelType.GuildAnnouncement).setRequired(true)).addRoleOption(opt=>opt.setName('role').setDescription('Role yang secara eksplisit akan diping').setRequired(false))).toJSON());
 
 
 // NIGHTMARE_REALTIME_SERVER_STATUS
@@ -618,6 +657,58 @@ client.once('clientReady', () => {
   console.log(`[TICKET] Jadwal penghapusan dipulihkan: ${recovered} tiket.`);
 });
 
+client.once('clientReady', async () => {
+  let entries;
+  try { entries = radioStore.list(); }
+  catch (error) {
+    console.error(`[RADIO] Konfigurasi gagal dibaca; tidak diubah: ${safeErrorDiagnostic(error)}`);
+    return;
+  }
+  for (const config of entries) {
+    if (config.mode !== 'radio' || !config.autoReconnect || !config.stationId || !config.voiceChannelId) continue;
+    const station = RADIO_STATION_BY_ID.get(config.stationId);
+    if (!station?.available) {
+      console.warn(`[RADIO] guild=${config.guildId} pemulihan ditahan: ${station?.name || config.stationId} belum memiliki sumber audio/izin yang terverifikasi; konfigurasi dipertahankan.`);
+      continue;
+    }
+    let guild;
+    let channel;
+    let lookupError;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        guild = client.guilds.cache.get(config.guildId) || await client.guilds.fetch(config.guildId);
+        channel = guild.channels.cache.get(config.voiceChannelId) || await guild.channels.fetch(config.voiceChannelId);
+        break;
+      } catch (error) {
+        lookupError = error;
+        if ([10003, 10004, 50001, 50013].includes(Number(error.code))) break;
+        if (attempt < 5) await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 1_000 * (2 ** (attempt - 1)))));
+      }
+    }
+    if (!guild || !channel) {
+      console.warn(`[RADIO] guild=${config.guildId} pemulihan dilewati: guild/channel tidak dapat divalidasi; konfigurasi dipertahankan: ${safeErrorDiagnostic(lookupError || new Error('guild/channel unavailable'))}`);
+      continue;
+    }
+    const botMember = guild.members.me || await guild.members.fetchMe().catch(error => { lookupError = error; return null; });
+    if (!botMember || !channel?.isVoiceBased?.() || !channel.permissionsFor(botMember)?.has([PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
+      console.warn(`[RADIO] guild=${config.guildId} pemulihan dilewati: channel atau izin Connect/Speak tidak valid; konfigurasi dipertahankan${lookupError ? `: ${safeErrorDiagnostic(lookupError)}` : ''}.`);
+      continue;
+    }
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        const restored = await musicManager.restoreRadio(guild, channel);
+        if (!restored.restored) {
+          console.warn(`[RADIO] guild=${config.guildId} pemulihan dilewati: ${restored.reason}; konfigurasi dipertahankan.`);
+        }
+        break;
+      } catch (error) {
+        console.warn(`[RADIO] guild=${config.guildId} pemulihan percobaan=${attempt}/5 gagal; konfigurasi tetap tersimpan: ${safeErrorDiagnostic(error)}`);
+        if (attempt < 5) await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 1_000 * (2 ** (attempt - 1)))));
+      }
+    }
+  }
+});
+
 
 function safeDiscordText(value) {
   return String(value).replace(/@/g, '@\u200b').replace(/([\\`*_{}\[\]()#+\-.!|>~])/g, '\\$1');
@@ -637,6 +728,94 @@ function safeErrorDiagnostic(error) {
 function requireGuild(interaction) {
   if (!interaction.inGuild() || !interaction.guild) throw new Error('Perintah ini hanya bisa digunakan di server.');
   return interaction.guild;
+}
+
+function hasManageGuildPermission(interaction) {
+  return hasRadioAdminPermission(interaction.memberPermissions, PermissionFlagsBits);
+}
+
+async function handleRadioCommand(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    const guild = requireGuild(interaction);
+    const action = interaction.options.getSubcommand();
+    if (action === 'status') {
+      const snapshot = musicManager.getSnapshot(guild.id);
+      const config = radioStore.get(guild.id);
+      const stationId = snapshot.radioStationId || config.stationId;
+      const station = RADIO_STATION_BY_ID.get(stationId);
+      const mode = snapshot.mode === 'radio' ? 'Radio Mode aktif' : config.mode === 'radio' && config.autoReconnect ? 'Radio Mode dikehendaki (sedang tidak tersambung)' : `${snapshot.mode === 'off' || config.mode === 'off' ? 'Off' : 'Music Mode'}`;
+      const availability = station ? (station.available ? 'siap' : 'belum tersedia: sumber/izin belum diverifikasi') : 'belum dipilih';
+      return await interaction.editReply([
+        `Mode: **${mode}**`,
+        `Stasiun terakhir: **${station?.name || 'belum dipilih'}** (${availability})`,
+        `Voice channel: ${snapshot.voiceChannelId || config.voiceChannelId || 'tidak terhubung'}`,
+        `Status sumber: **${snapshot.sourceStatus}**${snapshot.sourceStatus === 'source_not_configured' ? ' (sumber audio belum dikonfigurasi)' : ''}`,
+        `Koneksi: ${snapshot.connectionStatus}; player: ${snapshot.playerStatus}; pemulihan otomatis: ${config.autoReconnect ? 'aktif' : 'nonaktif'}`,
+        `Antrean musik tersimpan di memory: ${snapshot.queue.length} lagu.`
+      ].join('\n'));
+    }
+    if (!hasManageGuildPermission(interaction)) throw new Error('Perintah pengaturan radio memerlukan izin Manage Server atau Administrator.');
+    if (action === 'station') {
+      const stationId = interaction.options.getString('name', true);
+      const station = RADIO_STATION_BY_ID.get(stationId);
+      if (!station) throw new Error('Stasiun tidak dikenal.');
+      const snapshot = musicManager.getSnapshot(guild.id);
+      radioStore.setStation(guild.id, stationId);
+      if (snapshot.mode === 'radio') {
+        const sourceStatus = musicManager.getRadioSourceStatus(stationId);
+        if (sourceStatus !== 'source_configured') {
+          await musicManager.moveToMusic(guild.id);
+          return await interaction.editReply(`Pilihan **${station.name}** disimpan. Radio dihentikan karena sumber audio belum siap (${sourceStatus}); gunakan Radio Mode lagi setelah sumber dikonfigurasi dan diverifikasi.`);
+        }
+        const channel = guild.channels.cache.get(snapshot.voiceChannelId);
+        if (!channel) {
+          await musicManager.moveToMusic(guild.id);
+          return await interaction.editReply(`Pilihan **${station.name}** disimpan. Radio dihentikan karena voice channel tidak ditemukan.`);
+        }
+        try {
+          await musicManager.moveToRadio(guild, channel, stationId);
+          return await interaction.editReply(`Stasiun **${station.name}** disimpan dan Radio Mode aktif.`);
+        } catch (error) {
+          return await interaction.editReply(`Pilihan **${station.name}** disimpan, tetapi sumber gagal dimulai: ${String(error.message || 'error').slice(0, 1000)}`);
+        }
+      }
+      return await interaction.editReply(station.available
+        ? `Stasiun **${station.name}** disimpan. Gunakan /music move mode:radio untuk memulai.`
+        : `Pilihan **${station.name}** disimpan untuk server ini. Playback belum tersedia karena sumber dan izin Discord voice belum diverifikasi.`);
+    }
+    if (action === 'move') {
+      const target = interaction.options.getString('mode', true);
+      if (target !== 'music') throw new Error('Mode tujuan tidak valid.');
+      const result = await musicManager.moveToMusic(guild.id);
+      return await interaction.editReply(result.alreadyActive
+        ? 'Music Mode sudah aktif.'
+        : `Radio dihentikan; Music Mode aktif.${result.state?.queue.length ? ` Antrean musik dilanjutkan dari awal lagu aktif (${result.state.queue.length} lagu menunggu).` : ' Antrean musik dipertahankan.'}`);
+    }
+    throw new Error('Subcommand radio tidak dikenal.');
+  } catch (error) {
+    return await interaction.editReply('❌ ' + String(error.message || 'Radio gagal diproses.').slice(0, 1800));
+  }
+}
+
+async function handleMusicModeCommand(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    const guild = requireGuild(interaction);
+    if (!hasManageGuildPermission(interaction)) throw new Error('Perpindahan mode memerlukan izin Manage Server atau Administrator.');
+    if (interaction.options.getString('mode', true) !== 'radio') throw new Error('Mode tujuan tidak valid.');
+    const current = musicManager.getSnapshot(guild.id);
+    if (current.mode === 'radio') return await interaction.editReply('Radio Mode sudah aktif.');
+    const config = radioStore.get(guild.id);
+    if (!config.stationId) throw new Error('Pilih stasiun terlebih dahulu melalui /radio station.');
+    const { channel } = await requireMusicVoice(interaction);
+    const station = RADIO_STATION_BY_ID.get(config.stationId);
+    if (!station?.available) throw new Error(`Stasiun ${station?.name || config.stationId} belum tersedia. Sumber stream dan izin rebroadcast Discord voice belum diverifikasi.`);
+    const result = await musicManager.moveToRadio(guild, channel, config.stationId);
+    return await interaction.editReply(result.alreadyActive ? 'Radio Mode sudah aktif.' : `Radio Mode aktif: **${station.name}**. Antrean musik tetap tersimpan.`);
+  } catch (error) {
+    return await interaction.editReply('❌ ' + String(error.message || 'Radio gagal diproses.').slice(0, 1800));
+  }
 }
 
 async function requireMusicVoice(interaction) {
@@ -1165,6 +1344,7 @@ async function handleMusicCommand(interaction) {
     deferred = true;
     const guild = requireGuild(interaction);
     if (name === 'play') {
+      if (musicManager.getSnapshot(guild.id).mode === 'radio') throw new Error('Radio Mode aktif. Jalankan /radio move mode:music terlebih dahulu.');
       const { channel } = await requireMusicVoice(interaction);
       const query = interaction.options.getString('query', true);
       const result = await musicManager.enqueue(guild, channel, query, interaction.user, {
@@ -1197,9 +1377,18 @@ async function handleMusicCommand(interaction) {
     }
     if (name === 'queue' || name === 'nowplaying') {
       const snapshot = musicManager.getSnapshot(guild.id);
+      if (name === 'nowplaying' && snapshot.mode === 'radio') {
+        const station = RADIO_STATION_BY_ID.get(snapshot.radioStationId || radioStore.get(guild.id).stationId);
+        if (!station) throw new Error('Stasiun radio belum dipilih.');
+        return await interaction.editReply(`📻 **${safeDiscordText(station.name)}**\nMode: Radio${station.available ? '' : ' · sumber belum tersedia'}\nPlayer: ${snapshot.playerStatus} · Voice: ${snapshot.connectionStatus}`);
+      }
       if (!snapshot.current && !snapshot.queue.length) throw new Error('Tidak ada lagu yang sedang diputar atau diantrekan.');
       if (name === 'nowplaying') {
         const entry = snapshot.current;
+        if (entry.kind === 'radio') {
+          const station = RADIO_STATION_BY_ID.get(entry.stationId);
+          return await interaction.editReply(`📻 **${safeDiscordText(station?.name || entry.stationId)}**\nRadio Mode · player ${snapshot.playerStatus}`);
+        }
         const track = entry.track;
         if (!track) throw new Error('Lagu sedang disiapkan; coba lagi sebentar.');
         const requester = entry.requester || 'Tidak diketahui';
@@ -1212,7 +1401,8 @@ async function handleMusicCommand(interaction) {
       const lines = [];
       if (snapshot.current) {
         const track = snapshot.current.track;
-        lines.push('▶️ **Sedang diputar:** ' + (track ? safeDiscordText(track.title) : 'Menyiapkan lagu…') +
+        if (snapshot.current.kind === 'radio') lines.push(`📻 **Radio:** ${safeDiscordText(RADIO_STATION_BY_ID.get(snapshot.current.stationId)?.name || snapshot.current.stationId)}`);
+        else lines.push('▶️ **Sedang diputar:** ' + (track ? safeDiscordText(track.title) : 'Menyiapkan lagu…') +
           (track?.duration ? ' (`' + formatDuration(track.duration) + '`)' : ''));
       }
       for (const [index, entry] of snapshot.queue.slice(0, 15).entries()) {
@@ -1240,7 +1430,10 @@ async function handlePlaylistCommand(interaction) {
     deferred = true;
     const guild = requireGuild(interaction);
     const action = interaction.options.getSubcommand();
-    if (action === 'play') await requireMusicVoice(interaction);
+    if (action === 'play') {
+      if (musicManager.getSnapshot(guild.id).mode === 'radio') throw new Error('Radio Mode aktif. Jalankan /radio move mode:music terlebih dahulu.');
+      await requireMusicVoice(interaction);
+    }
     if (action === 'create') {
       const playlist = playlistStore.create(guild.id, interaction.options.getString('name', true));
       return await interaction.editReply('✅ Playlist server **' + playlist.name + '** dibuat.');
@@ -1357,8 +1550,16 @@ async function handleBotProfileCommand(interaction) {
 }
 
 client.on('interactionCreate', async interaction => {
+  interactionDiagnostics.instrument(interaction, 'component-listener');
+  try {
+  if (interaction.isModalSubmit?.() && interaction.customId?.startsWith('nightmare_announce_modal:')) {
+    return await handleAnnouncementModal(interaction, announcementDraftStore);
+  }
   if (!interaction.isButton()) return;
 
+  if (interaction.customId?.startsWith('nightmare_announce:')) {
+    return await handleAnnouncementComponent(interaction, announcementDraftStore);
+  }
   if (interaction.customId === 'nightmare_giveaway_enter') {
     return await handleGiveawayButton(interaction, giveawayStore);
   }
@@ -1398,9 +1599,9 @@ client.on('interactionCreate', async interaction => {
     return;
   }
 
-  const resetAction = interaction.customId.match(/^nightmare_reset_(confirm|cancel):(\d{17,20})$/);
+  const resetAction = interaction.customId.match(/^nightmare_reset_(confirm|cancel):([\da-f-]{36})$/i);
   if (!resetAction) {
-    if (interaction.customId === 'nightmare_reset_confirm' || interaction.customId === 'nightmare_reset_cancel') {
+    if (interaction.customId?.startsWith('nightmare_reset_')) {
       try {
         await interaction.reply({ content: 'Tombol reset ini sudah kedaluwarsa. Jalankan kembali /resetserver jika memang diperlukan.', flags: MessageFlags.Ephemeral });
       } catch (error) {
@@ -1411,39 +1612,48 @@ client.on('interactionCreate', async interaction => {
   }
 
   try {
-  const [, action, ownerId] = resetAction;
+    const [, action, confirmationId] = resetAction;
+    if (!interaction.inGuild() || !interaction.guildId) {
+      return await interaction.reply({ content: 'Perintah ini hanya bisa digunakan di server.', flags: MessageFlags.Ephemeral });
+    }
 
-  if (interaction.user.id !== ownerId) {
-    return await interaction.reply({
-      content: 'Hanya administrator yang memulai reset ini yang dapat mengonfirmasi atau membatalkannya.',
-      flags: MessageFlags.Ephemeral
-    });
-  }
+    const confirmation = resetConfirmationGuard.get(confirmationId);
+    if (!confirmation || confirmation.guildId !== interaction.guildId) {
+      return await interaction.reply({ content: 'Konfirmasi reset ini sudah kedaluwarsa atau sudah digunakan. Jalankan /resetserver untuk membuat konfirmasi baru.', flags: MessageFlags.Ephemeral });
+    }
+    if (interaction.user.id !== confirmation.ownerId) {
+      return await interaction.reply({ content: 'Hanya administrator yang memulai reset ini yang dapat mengonfirmasi atau membatalkannya.', flags: MessageFlags.Ephemeral });
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      return await interaction.reply({ content: 'Hanya administrator yang bisa melakukan tindakan ini.', flags: MessageFlags.Ephemeral });
+    }
 
-  if (!interaction.inGuild()) {
-    return interaction.reply({
-      content: 'Perintah ini hanya bisa digunakan di server.',
-      flags: MessageFlags.Ephemeral
-    });
-  }
+    if (action === 'cancel') {
+      if (!resetConfirmationGuard.cancel(confirmationId, interaction.user.id, interaction.guildId)) {
+        return await interaction.reply({ content: 'Konfirmasi reset ini sudah diproses atau tidak lagi aktif.', flags: MessageFlags.Ephemeral });
+      }
+      return await interaction.update({ content: 'Reset dibatalkan. Tidak ada perubahan.', components: [] });
+    }
 
-  if (!interaction.memberPermissions?.has(
-    PermissionFlagsBits.Administrator
-  )) {
-    return interaction.reply({
-      content: 'Hanya administrator yang bisa melakukan tindakan ini.',
-      flags: MessageFlags.Ephemeral
-    });
-  }
+    const claim = resetConfirmationGuard.claim(confirmationId, interaction.user.id, interaction.guildId);
+    if (!claim.claimed) {
+      const message = claim.status === 'running'
+        ? 'Reset ini sedang diproses. Klik ulang tidak akan memulai operasi kedua.'
+        : claim.status === 'completed'
+          ? 'Konfirmasi reset ini sudah selesai digunakan. Jalankan /resetserver jika perlu membuat reset baru.'
+          : 'Konfirmasi reset ini sudah tidak aktif. Jalankan /resetserver untuk membuat konfirmasi baru.';
+      return await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
+    }
 
-  if (action === 'cancel') {
-    return await interaction.update({
-      content: 'Reset dibatalkan. Tidak ada perubahan.',
-      components: []
-    });
-  }
+    try {
+      await interaction.deferUpdate();
+    } catch (error) {
+      // No destructive request has started; permit a fresh click if Discord
+      // rejected this component acknowledgment.
+      resetConfirmationGuard.release(confirmationId);
+      throw error;
+    }
 
-  await interaction.deferUpdate();
 
   try {
     const guild = interaction.guild;
@@ -1453,6 +1663,7 @@ client.on('interactionCreate', async interaction => {
       !me.permissions.has(PermissionFlagsBits.ManageChannels) ||
       !me.permissions.has(PermissionFlagsBits.ManageRoles)
     ) {
+      resetConfirmationGuard.finish(confirmationId, 'failed');
       return await interaction.editReply({
         content: 'Reset dibatalkan. Nightmare memerlukan izin Manage Channels dan Manage Roles.',
         components: []
@@ -1572,18 +1783,20 @@ client.on('interactionCreate', async interaction => {
           ' kegagalan. Role tidak akan dihapus jika penghapusan channel/kategori gagal.'
         : '\nOperasi channel dan kategori berhasil.');
 
+    resetConfirmationGuard.finish(confirmationId, 'completed');
     return await interaction.editReply({
       content: summary.slice(0, 1900),
       components: []
     });
   } catch (error) {
+    resetConfirmationGuard.finish(confirmationId, 'failed');
     const code = Number.isInteger(error?.code) ? error.code : 'none';
     console.error(`[RESET SERVER] Komponen gagal acknowledged=${interaction.deferred || interaction.replied} ${safeErrorDiagnostic(error)}`);
     if (code === 10062 || code === 40060) return;
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({
-          content: '❌ Reset gagal atau terhenti. Periksa log bot sebelum mencoba lagi.',
+          content: '❌ Reset gagal atau terhenti. Konfirmasi ini telah ditutup; periksa kondisi server, lalu jalankan /resetserver untuk membuat konfirmasi baru.',
           components: []
         });
       } else {
@@ -1597,13 +1810,30 @@ client.on('interactionCreate', async interaction => {
     const code = Number.isInteger(error?.code) ? error.code : 'none';
     console.error(`[RESET SERVER] Acknowledgment komponen gagal ${safeErrorDiagnostic(error)}`);
   }
+  } catch (error) {
+    const diagnostic = interactionDiagnostics.reportFailure(interaction, 'component-listener', error);
+    if (diagnostic.attempts === 0 && !interaction.replied && !interaction.deferred && interaction.isRepliable?.()) {
+      try { await interaction.reply({ content: '❌ Komponen gagal diproses. Coba ulangi tindakan dari command.', flags: MessageFlags.Ephemeral }); }
+      catch (replyError) { interactionDiagnostics.reportFailure(interaction, 'component-error-reply', replyError); }
+    }
+  }
 });
 
 client.on('interactionCreate', async interaction => {
+  const diagnostic = interactionDiagnostics.instrument(interaction, 'command-dispatcher');
   interactionDispatchStartedAt.set(interaction, performance.now());
   if (interaction.isAutocomplete()) {
     try { return await handleEconomyAutocomplete(interaction); }
-    catch (error) { console.error(`[ECONOMY] Autocomplete gagal: ${error.message}`); if (!interaction.responded) return interaction.respond([]); }
+    catch (error) {
+      interactionDiagnostics.reportFailure(interaction, 'autocomplete', error);
+      // Only provide an empty result when the handler failed before attempting
+      // its one allowed autocomplete response. A rejected respond() is not retried.
+      if (!interaction.responded && diagnostic.attempts === 0) {
+        try { return await interaction.respond([]); }
+        catch (responseError) { interactionDiagnostics.reportFailure(interaction, 'autocomplete-fallback', responseError); }
+      }
+      return;
+    }
   }
   if (!interaction.isChatInputCommand()) return;
 
@@ -1626,6 +1856,9 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'economy-admin') return await handleEconomyAdmin(interaction, economyStore);
     if (interaction.commandName === 'item') return await handleItemAdmin(interaction, economyStore);
     if (interaction.commandName === 'adventure') return await handleAdventure(interaction, economyStore);
+    if (interaction.commandName === 'announcement') return await handleAnnouncementCreate(interaction, announcementDraftStore);
+    if (interaction.commandName === 'radio') return await handleRadioCommand(interaction);
+    if (interaction.commandName === 'music') return await handleMusicModeCommand(interaction);
     if (interaction.commandName === 'ticket') return await handleTicketCommand(interaction, ticketStore, {
       onClosed: (guildId, channelId) => ticketDeletionScheduler.schedule(guildId, channelId),
       onReopened: (guildId, channelId) => ticketDeletionScheduler.cancel(guildId, channelId)
@@ -1661,23 +1894,23 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
-      const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId('nightmare_reset_confirm:' + interaction.user.id)
-          .setLabel('Konfirmasi reset')
-          .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-          .setCustomId('nightmare_reset_cancel:' + interaction.user.id)
-          .setLabel('Batal')
-          .setStyle(ButtonStyle.Secondary)
-      );
-
       acknowledgmentAttempted = true;
       await interaction.deferReply({
         flags: MessageFlags.Ephemeral
       });
+
+      const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+      const confirmationId = resetConfirmationGuard.issue({ guildId: interaction.guildId, ownerId: interaction.user.id });
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('nightmare_reset_confirm:' + confirmationId)
+          .setLabel('Konfirmasi reset')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId('nightmare_reset_cancel:' + confirmationId)
+          .setLabel('Batal')
+          .setStyle(ButtonStyle.Secondary)
+      );
 
       return await interaction.editReply({
         content: '⚠️ **Reset server bersifat destruktif dan tidak dapat dibatalkan.** Jika dikonfirmasi, bot menghapus semua channel selain `#setup`, semua kategori, dan semua role yang dapat dikelolanya. Pastikan cadangan tersedia sebelum melanjutkan.',
@@ -1942,18 +2175,24 @@ client.on('interactionCreate', async interaction => {
 
     await interaction.editReply(result);
   } catch (error) {
-    console.error('Interaction error:', safeErrorDiagnostic(error));
+    const diagnostic = interactionDiagnostics.reportFailure(interaction, 'command-dispatcher', error);
 
     // Jangan membuat crash jika Discord sudah menganggap
     // interaksi kedaluwarsa atau responsnya tidak bisa dikirim.
-    if (error.code === 10062 || error.code === 40060) return;
-    if (acknowledgmentAttempted) return;
+    // Never retry an expired/ambiguous initial acknowledgment. If a defer was
+    // confirmed, replace its loading response with a safe error instead.
+    const responseAction = errorResponseAction(interaction, diagnostic, error);
+    if (responseAction === 'none') return;
 
     try {
-      if (interaction.deferred || interaction.replied) {
+      if (responseAction === 'edit') {
         await interaction.editReply(
           '❌ Terjadi kesalahan. Periksa log Termux.'
         );
+      } else if (interaction.replied) {
+        return;
+      } else if (acknowledgmentAttempted) {
+        return;
       } else if (interaction.isRepliable()) {
         await interaction.reply({
           content: '❌ Terjadi kesalahan. Coba lagi.',
